@@ -53,7 +53,8 @@ class Blur(nn.Module):
 		# update timer
 		end = timer()    
 		self.forward_timer=end-start
-		
+
+
 		# return
 		return y.reshape(og_x_shape)
 		
@@ -111,7 +112,7 @@ class NonstationaryBlur(Blur):
 
 		# set forward method
 		if self.lattice.decomposed is True:
-			self._forward=self._forward_decomposed
+			self._forward=self._forward_nondecomposed
 		else:
 			self._forward=self._forward_nondecomposed
 
@@ -768,3 +769,21 @@ def unravel_multi_index(index, shape):
 def ravel_multi_index(index, shape):
 	return np.ravel_multi_index(index,shape)
 
+
+# peak signal to noise ratio
+def psnr(original, compressed):
+    # normalize in [0,1] both original and compressed signals
+    original=(original-torch.min(original))/(torch.max(original)-torch.min(original))
+    compressed=(compressed-torch.min(compressed))/(torch.max(compressed)-torch.min(compressed))
+    
+    # calculate mse
+    mse = torch.mean((original - compressed) ** 2)
+    
+    # mse is zero means no noise is present in the signal 
+    if(mse == 0):           
+        return torch.tensor(float('inf'))
+    
+    # calculate psnr
+    max_pixel = 1.0
+    psnr = 20 * torch.log10(max_pixel / torch.sqrt(mse))
+    return psnr
