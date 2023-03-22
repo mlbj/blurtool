@@ -2,6 +2,9 @@ import math
 import torch
 import torch.nn as nn
 import torch.fft
+import torchvision
+import PIL
+import cv2
 
 import torch.multiprocessing as mp
 mp.set_sharing_strategy('file_system')
@@ -106,7 +109,16 @@ class NonstationaryBlur(Blur):
 		# other attributes
 		self._temp_x=None
 
-	def _forward(self,x,n_pool=1,debug=False):
+		# set forward method
+		if self.lattice.decomposed is True:
+			self._forward=self._forward_decomposed
+		else:
+			self._forward=self._forward_nondecomposed
+
+	# nonstationary blur can for forwarded in a different ways depending whether self.lattice is decomposed or not. 
+	# since kernels are computed using eigenkernels normally when the lattice is decomposed, it would be fine to just 
+	# use the _forward_nondecomposed always. however, for decomposed lattices, _forward_decomposed is way faster.
+	def _forward_nondecomposed(self,x,n_pool=1,debug=False):
 		y=torch.zeros(x.shape)
 
 		# linear forward
@@ -177,6 +189,11 @@ class NonstationaryBlur(Blur):
 
 		return yijk
 
+
+	# decomposed forward method
+	def _forward_decomposed(self,x,n_pool=1,debug=False):
+		return 0
+
 '''
 Kernel class
 '''
@@ -226,7 +243,7 @@ class Kernel:
 		gaussian_kernel = 1. / (2. * pi * sx * sy) * torch.exp(-((xx - mx)**2. / (2. * sx**2.) + (yy - my)**2. / (2. * sy**2.)))
 
 		# rotate using scipy
-		# todo: implement with torch
+		# TODO: implement with torch
 		rotated_kernel=scipy.ndimage.rotate(gaussian_kernel.detach().clone().numpy(),angle,mode='nearest',reshape=False).transpose()
 		rotated_kernel=torch.tensor(rotated_kernel).double()
 
@@ -246,12 +263,13 @@ class Lattice:
 		self.shape=shape
 		self.lattice_pars=lattice_pars
 		self.kernel_shape=None
+		self.decomposed=False
 
 		# find out kernel_shape, if needed/possible
 		if kernel_shape is None:
-			if self.kernel([0,0]) is not None:
+			if self.kernel((0,0)) is not None:
 				# currently all kernels must be of the same shape, so use the first one.
-				self.kernel_shape=self.kernel([0,0])().shape
+				self.kernel_shape=self.kernel((0,0))().shape
 			else:
 				self.kernel_shape=None
 		else:
@@ -264,7 +282,7 @@ class Lattice:
 
 	# this method returns a sampled lattice of shape sampled_shape whose kernels are 
 	# regularly sampled from the current lattice.
-	# todo: unit test of sample regularity 
+	# TODO: unit test of sample regularity 
 	def sample(self,sampled_shape):
 		# cast a grid of the same img_shape as the current lattice, but using the new sampled lattice shape
 		sample_grid,table=self.grid(sampled_shape,return_table=True)
@@ -317,7 +335,7 @@ class Lattice:
 			# self.table_j=self.table_j.astype(int)
 
 		# return blurred test grid if needed
-		# todo: fix number of pools
+		# TODO: fix number of pools
 		if blur is True:
 			test_blur=NonstationaryBlur(self)
 			test_grid=test_blur.forward(test_grid,n_pool=4)
@@ -328,7 +346,7 @@ class Lattice:
 			return test_grid
 
 
-	# stack kernels into a matrix of the form [kernel_shape[0]*kernel_shape[1],n_kernels], where n_kernels=self.shape[0]*self.shape[1].
+	# stack kernels into a matrix of the form [kernel_shape[0]*kernel_shape[1],self.shape[0]*self.shape[1]]
 	# WARNING: i don't recommend runnning this if self.shape is too big, since it stores the kernel.__call__() data for all kernels. 
 	#		  the correct way to do it, is to sample the big lattice into a smaller one, and only then stacking the sampled kernels 
 	# 		  to be decomposed.	 
@@ -340,15 +358,32 @@ class Lattice:
 		# fill one kernel at the time
 		for i in range(self.shape[0]):
 			for j in range(self.shape[1]):
-				pos=[i,j]
+				pos=(i,j)
 				raveled_pos=ravel_multi_index((i,j),(self.shape[0],self.shape[1]))
 				stacked_kernels[:,raveled_pos]=self.kernel(pos)().reshape(self.kernel_shape[0]*self.kernel_shape[1])
 
 		return stacked_kernels
 
-	# unstack kernels from a matrix of shape [kernel_shape[0]*kernel_shape[1],n_kernels] to a dictionary (or maybe a list?)
+	# unstack kernels from a matrix of shape [kernel_shape[0]*kernel_shape[1],self.shape[0]*self.shape[1]] to a 
+	# dictionary. stacked_kernels is the same number of kernels as the number of points of the current lattice object.
+	# Also, each kernel is expected to have the same shape as in self.kernel_shape.
+	# TODO: write a unit test using this function 
 	def unstack_kernels(self,stacked_kernels):
-		return None
+		# check dimensions
+		if stacked_kernels.shape[0]!=self.kernel_shape[0]*self.kernel_shape[1]:
+			raise ValueError('Kernel shape mismatch in unstack_kernels()')
+		if stacked_kernels.shape[1]!=self.shape[0]*self.shape[1]:
+			raise ValueError('Lattice shape mismatch in unstack_kernels()')
+
+		kernels={}
+		for i in range(self.shape[0]):
+			for j in range(self.shape[1]):
+				pos=(i,j)
+				ravaled_pos=ravel_multi_index((i,j),(self.shape[0],self.shape[1]))
+				psf_data=stacked_kernels[:,ravaled_pos].reshape(self.kernel_shape[0],self.kernel_shape[1])
+				kernel=Kernel(self.kernel_shape,mode='from_data',psf_data=psf_data)
+				kernels[pos]=kernel
+
 
 '''
 RotatedGaussian class implements the rotated gaussian model of nonstationary blur. 
@@ -403,18 +438,20 @@ class RotGaussian(Lattice):
 '''
 DecomposeLattice subclass. 
 eigenkernels are sorted and stored in a list as an attribute.
+TODO: instead of having modes set inside DecomposeLattice, in a future version, it would be appropriate to 
+      have a nn.Module object which decomposes the lattice as a parameter.
 '''
 class DecomposeLattice(Lattice):
 	def __init__(self,input_lattice,img_shape,mode='pca',decompose_pars=None):
-		super().__init__(img_shape)
+		super().__init__(img_shape,kernel_shape=input_lattice.kernel_shape)
 
 		# eigenkernel related attributes
 		self.eigenkernels=[]
-		self.coefs=None
+		self.eigencoefs=[]
+		self.noninterpolated_eigencoefs=[]
 		self.rank=0
 
-		# misc attributes
-		self.decomposed=False
+		# other attributes
 		self.decompose_pars=decompose_pars
 		self.input_lattice_shape=input_lattice.shape
 
@@ -429,16 +466,46 @@ class DecomposeLattice(Lattice):
 			raise TypeError('Unrecognized mode in DecomposeLattice')
 
 
+	# unstack a matrix of eigenkernels (data) into a list of callable kernel objects with from_data mode.
+	# TODO: reordering parameter if needed
+	def unstack_eigenkernels(self,stacked_eigenkernels):
+		# check dimensions
+		if stacked_eigenkernels.shape[0]!=self.kernel_shape[0]*self.kernel_shape[1]:
+			raise ValueError('Kernel shape mismatch in unstack_eigenkernels()')
+
+		eigenkernels=[]
+		for i in range(stacked_eigenkernels.shape[1]):
+			psf_data=stacked_eigenkernels[:,i].reshape(self.kernel_shape[0],self.kernel_shape[1])
+			eigenkernel=Kernel(self.kernel_shape,mode='from_data',psf_data=psf_data)
+			eigenkernels.append(eigenkernel)
+
+		self.eigenkernels=eigenkernels
+
+
 	# overload the kernel method to interpolated eigenkernel representation 
 	def kernel(self,pos):
-		return 0
+		pos=tuple(pos)
+		psf_data=torch.zeros(self.kernel_shape)#+self.mean_kernel
+		for c in range(self.rank):
+			psf_data=psf_data+self.eigencoefs[c][pos].item()*self.eigenkernels[c]()
+
+		return Kernel(self.kernel_shape,psf_data=psf_data,mode='from_data')
+
+	def noninterpolated_kernel(self,pos):
+		pos=tuple(pos)
+		psf_data=torch.zeros(self.kernel_shape)#+self.mean_kernel
+		for c in range(self.rank):
+			psf_data=psf_data+self.noninterpolated_eigencoefs[c][pos].item()*self.eigenkernels[c]()
+
+		return Kernel(self.kernel_shape,psf_data=psf_data,mode='from_data')
+
 
 	# return a lattice whose kernels are the eigenkernels of self.kernels 
 	def _pca(self,input_lattice):
 		# check if it's already decomposed
 
 		# unpack decompose_pars
-		rank=decompose_pars.get('r',input_lattice.shape[0]*input_lattice.shape[1])
+		rank=self.decompose_pars.get('r',input_lattice.shape[0]*input_lattice.shape[1])
 
 		# mean bias is stored in the last element, so add one to rank
 		self.rank=rank+1
@@ -448,49 +515,78 @@ class DecomposeLattice(Lattice):
 
 		# store and subtract the mean kernel of each (stacked) kernel
 		# TODO: check if that's correct again
-		mean_kernel=torch.mean(stacked_kernels,dim=1)
+		stacked_mean_kernel=torch.mean(stacked_kernels,dim=1)
 		for i in range(input_lattice.shape[0]):
 			for j in range(input_lattice.shape[1]):
 				unraveled_pos=(i,j)
 				index=ravel_multi_index(unraveled_pos,input_lattice.shape)
-				stacked_kernels[:,index]=stacked_kernels[:,index]-mean_kernel   
-        
+				stacked_kernels[:,index]=stacked_kernels[:,index]-stacked_mean_kernel
+
+		# save mean_kernel 
+		self.mean_kernel=stacked_mean_kernel.reshape(self.kernel_shape)  
+
         # allocate coefs.
         # TODO: check if it is really 'self.rank+1'.
 		stacked_coefs=torch.zeros((self.kernel_shape[0]*self.kernel_shape[1],self.rank+1))
         
-# #         self.E,self.D,Vt=scipy.linalg.svd(self.P)       
-# #         self.Cni=np.diag(self.D[:self.r-1]).dot(Vt[:self.r-1,:]).transpose()
-
-# #         self.E,self.D,Vt=scipy.linalg.svd(self.P)     
-# #         self.E=self.E[:,:self.r-1].dot(np.diag(self.D[:self.r-1]))
-# #         self.Cni=Vt[:self.r-1,:].transpose()
-
 		# run SVD
 		# TODO: use torch.
 		U,D,Vt=scipy.linalg.svd(stacked_kernels.clone().detach().numpy())     
 		stacked_eigenkernels=torch.from_numpy(U[:,:self.rank])
 		stacked_noninterpolated_coefs=torch.from_numpy((np.diag(D[:self.rank]).dot(Vt[:self.rank,:])).transpose())
-        
-# #         self.Cni[:,0]=np.ones((self.t1*self.t2))
-# #         self.E[:,0]=self.mean_kernel
 
-		stacked_noninterpolated_coefs=torch.cat((torch.ones(self.shape[0]*self.shape[1],1),stacked_noninterpolated_coefs),dim=1)
-		stacked_eigenkernels=torch.cat((mean_kernel.reshape(self.shape[0]*self.shape[1],1),stacked_eigenkernels),dim=1)
-        
-#         print(self.Cni.shape)
-#         print(E.shape)
+		# insert mean kernel information at the begining 
+		stacked_ones_coefs=torch.ones(self.input_lattice_shape[0]*self.input_lattice_shape[1],1)
+		stacked_noninterpolated_coefs=torch.cat((stacked_ones_coefs,stacked_noninterpolated_coefs),dim=1)
 
-#         for j in range(self.Cni.shape[1]):
-#             coef=self.Cni[:,j].reshape(self.t1,self.t1)
-            
-#             # bicubic interpolation
-#             coef=PIL.Image.fromarray(coef)
-#             coef=np.array(coef.resize((self.n1,self.n2),PIL.Image.BICUBIC))
-            
-#             # fill interpolated coefficients
-#             self.C[:,j]=coef.reshape(self.n1*self.n2)
-		return 0
+		stacked_mean_kernel=stacked_mean_kernel.reshape(self.kernel_shape[0]*self.kernel_shape[1],1)
+		stacked_eigenkernels=torch.cat((stacked_mean_kernel,stacked_eigenkernels),dim=1)
+
+		# set self.eigenkernels
+		self.unstack_eigenkernels(stacked_eigenkernels)
+
+		# interpolate coefs
+		coefs=[]
+		noninterpolated_coefs=[]
+		for j in range(stacked_noninterpolated_coefs.shape[1]):
+			noninterpolated_coef=stacked_noninterpolated_coefs[:,j].reshape(self.input_lattice_shape[0],self.input_lattice_shape[1])
+
+ 			# interpolate coef into self.shape 
+ 			# other possible choices for interpolation_mode: [cv2.INTER_CUBIC,cv2.INTER_LINEAR,cv2.INTER_NEAREST,cv2.INTER_AREA]
+			interpolation_mode=cv2.INTER_LANCZOS4
+			coef=cv2.resize(noninterpolated_coef.clone().detach().numpy(),self.shape,interpolation_mode)
+			coef=torch.from_numpy(coef).double()
+
+			# fill 
+			coefs.append(coef.double())
+			noninterpolated_coefs.append(noninterpolated_coef)
+
+			# interpolation debug
+			# print('------------------------------------------')
+			# print('j=',j)
+			# print('ni_min=',torch.min(noninterpolated_coef))
+			# print('ni_max=',torch.max(noninterpolated_coef))
+			# print('ni_norm=',torch.norm(noninterpolated_coef))	
+			# print('ni_mean=',torch.mean(noninterpolated_coef))	
+			# print('ni_std=',torch.std(noninterpolated_coef))	
+			# print('------------------------------------------')
+			# print('i_min=',torch.min(coef))
+			# print('i_max=',torch.max(coef))
+			# print('i_norm=',torch.norm(coef))	
+			# print('i_mean=',torch.mean(coef))
+			# print('i_std=',torch.std(coef))		
+			# print('------------------------------------------\n')
+			
+
+		# set coefs attribute
+		self.eigencoefs=coefs
+		self.noninterpolated_eigencoefs=noninterpolated_coefs
+
+		# set singular values
+		self.eigenvals=torch.tensor(D[:self.rank],dtype=torch.float64)
+
+		# set decomposed flag to True
+		self.decomposed=True
 
 	def _pcp(self,r=None):
 		# reset decomposed tag
@@ -542,7 +638,7 @@ misc functions
 '''
 
 # rectangular pad of specified width. output at dimension i is centered if pad_shape[i] is even.
-# todo: directly used torch.pad instead of this
+# TODO: directly used torch.pad instead of this
 def pad(x,pad_shape):
 
 	# attemps to suppress batch dimension
