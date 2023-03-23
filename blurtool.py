@@ -512,7 +512,8 @@ class DecomposeLattice(Lattice):
 		self.rank=rank+1
 
 		# stack input kernels and normalize 
-		stacked_kernels=normalize(input_lattice.stack_kernels())
+		#stacked_kernels=normalize(input_lattice.stack_kernels())
+		stacked_kernels=input_lattice.stack_kernels()
 
 		# store and subtract the mean kernel of each (stacked) kernel
 		# TODO: check if that's correct again
@@ -591,8 +592,71 @@ class DecomposeLattice(Lattice):
 
 	def _pcp(self,r=None):
 		# reset decomposed tag
+		self.decomposed=False
 
-		return 0
+		# stack kernels
+		stacked_kernels=input_lattice.stack_kernels()
+
+
+		# unpack decompose_pars
+		mu=self.decompose_pars.get('mu',0.25/torch.abs(torch.mean(stacked_kernels)))
+		lamb=self.decompose_pars.get('lamb',1/torch.sqrt(torch.max(stacked_kernels.shape[0],stacked_kernels.shape[1])))
+
+
+		# change to torch
+		stacked_kernels=stacked_kernels.clone().detach().numpy()
+		B=np.zeros(stacked_kernels.shape)
+		A=np.zeros(stacked_kernels.shape)
+		D=np.zeros(stacked_kernels.shape)
+
+		rank=0
+		err=tol+1
+		ite=0
+		while (err>tol) and (ite<max_iter):
+			err_denominator = np.linalg.norm(np.concatenate((B,A), axis=1), 'fro') 
+            
+			F=D/mu + self.P
+            
+			# B - subproblem
+			E = F - A;
+			dB = B;       
+			U, sigmas, V = np.linalg.svd(E, full_matrices=False);
+			rank = (sigmas > 1/mu).sum()
+			Sigma = np.diag(sigmas[0:rank] - 1/mu)
+			B = np.dot(np.dot(U[:,0:rank], Sigma), V[0:rank,:])
+			dB = B - dB
+            
+			# A - subproblem 
+			E = F - B
+			dA = A
+			A = proxl1(E,lamb/mu) 
+			dA = A - dA
+            
+			# Update Lambda (dual variable)
+			Z = self.P - A - B
+			D = D + mu*Z
+            
+			# err
+			err = np.linalg.norm(np.concatenate((dB, dA), axis=1), 'fro') / (err_denominator + 1)
+            
+			if debug==True:
+			print('ite=',ite,'. err=',err)
+            
+			# update ite
+			ite=ite+1
+        
+		# reports
+		print('mu=',mu,'. lamb=',lamb,'. rank=',rank)
+  
+		# pca fit
+		if r is None:
+			r=rank
+		# st=B
+
+		self.stacked_kernels()
+
+		decompose_pars={'r':r}
+		self._pca()
 
 
 ''' 
