@@ -5,6 +5,7 @@ import torch.fft
 import torchvision
 import PIL
 import cv2
+import copy
 
 import torch.multiprocessing as mp
 mp.set_sharing_strategy('file_system')
@@ -106,13 +107,14 @@ class NonstationaryBlur(Blur):
 		self._modules = {}
 
 		self.lattice=lattice
+		self.shape=self.lattice.shape
 
 		# other attributes
 		self._temp_x=None
 
 		# set forward method
 		if self.lattice.decomposed is True:
-			self._forward=self._forward_nondecomposed
+			self._forward=self._forward_decomposed
 		else:
 			self._forward=self._forward_nondecomposed
 
@@ -168,13 +170,13 @@ class NonstationaryBlur(Blur):
 			#compute everything in parallel at once using torch.multiprocessing.pool
 			with mp.get_context("spawn").Pool(n_pool) as pool:
 				args=[(i,j,k) for i in range(x.shape[0]) for j in range(x.shape[1]) for k in range(x.shape[2])]
-				y=torch.tensor(pool.map(self._forward_multi,args)).reshape(x.shape)
+				y=torch.tensor(pool.map(self._multi_forwardfun,args)).reshape(x.shape)
 
 		return y
 
 
 	# function to be mapped into pool
-	def _forward_multi(self,args):
+	def _multi_forwardfun(self,args):
 		# unpack parameters
 		i,j,k=args
 		pos=[j,k]
@@ -193,7 +195,23 @@ class NonstationaryBlur(Blur):
 
 	# decomposed forward method
 	def _forward_decomposed(self,x,n_pool=1,debug=False):
-		return 0
+		y=torch.zeros(x.shape)
+		pad_shape=(x.shape[1]-self.lattice.kernel_shape[0],x.shape[2]-self.lattice.kernel_shape[1])
+
+		for c in range(self.lattice.rank):
+			# create a blur object using the current padded eigenkernel
+			eigenkernel_data=self.lattice.eigenkernels[c]()
+			padded_eigenkernel_data=pad(eigenkernel_data,pad_shape)
+			padded_eigenkernel=Kernel(self.shape,psf_data=padded_eigenkernel_data,mode='from_data')
+			stat_blur=StationaryBlur(padded_eigenkernel)
+
+			# representation coefficients
+			coef=self.lattice.eigencoefs[c]
+
+			# define a stationary blur and operate
+			y=y+stat_blur.forward(coef*x)
+
+		return y
 
 '''
 Kernel class
@@ -283,8 +301,10 @@ class Lattice:
 
 	# this method returns a sampled lattice of shape sampled_shape whose kernels are 
 	# regularly sampled from the current lattice.
+	# sample_mode may be 'deep_copy' for copying the original Kernel objects, not only their reference. 
+	# or 'copy_data', which also creates new Kernel objects, but using 'from_data' Kernel psf_mode.
 	# TODO: unit test of sample regularity 
-	def sample(self,sampled_shape):
+	def sample(self,sampled_shape,sample_mode='copy_from_data'):
 		# cast a grid of the same img_shape as the current lattice, but using the new sampled lattice shape
 		sample_grid,table=self.grid(sampled_shape,return_table=True)
 		table_i,table_j=table
@@ -296,7 +316,14 @@ class Lattice:
 		for i in range(sampled_shape[0]):
 			for j in range(sampled_shape[1]):
 				sampled_pos=(table_i[i].item(),table_j[j].item())
-				sampled_kernels[(i,j)]=self.kernel(sampled_pos)
+				
+				# sample the current kernel
+				if sample_mode=='deep_copy':
+					sampled_kernels[(i,j)]=copy.deepcopy(self.kernel(sampled_pos))
+				if sample_mode=='copy_from_data':
+					psf_data=self.kernel(sampled_pos)()
+					sampled_kernels[(i,j)]=Kernel(self.kernel_shape,psf_data=psf_data,mode='from_data')
+
 
 		# define output sampled lattice
 		sampled_lattice=Lattice(sampled_shape)
@@ -385,6 +412,8 @@ class Lattice:
 				kernel=Kernel(self.kernel_shape,mode='from_data',psf_data=psf_data)
 				kernels[pos]=kernel
 
+		self.kernels=kernels
+
 
 '''
 RotatedGaussian class implements the rotated gaussian model of nonstationary blur. 
@@ -461,8 +490,8 @@ class DecomposeLattice(Lattice):
 
 		if mode=='pca':
 			self._pca(input_lattice)
-		elif mode=='pcp':
-			self._pcp(input_lattice)
+		elif mode=='pcp_rpca':
+			self._pcp_rpca(input_lattice)
 		else:
 			raise TypeError('Unrecognized mode in DecomposeLattice')
 
@@ -590,7 +619,7 @@ class DecomposeLattice(Lattice):
 		# set decomposed flag to True
 		self.decomposed=True
 
-	def _pcp(self,r=None):
+	def _pcp_rpca(self,input_lattice):
 		# reset decomposed tag
 		self.decomposed=False
 
@@ -598,49 +627,58 @@ class DecomposeLattice(Lattice):
 		stacked_kernels=input_lattice.stack_kernels()
 
 
+		# normalize 
+		# mi,ma=torch.min(stacked_kernels),torch.max(stacked_kernels)
+		# stacked_kernels=(stacked_kernels-mi)/(ma-mi)
+
 		# unpack decompose_pars
+		# mu=self.decompose_pars.get('mu',0.25/torch.abs(torch.mean(stacked_kernels)))
 		mu=self.decompose_pars.get('mu',0.25/torch.abs(torch.mean(stacked_kernels)))
-		lamb=self.decompose_pars.get('lamb',1/torch.sqrt(torch.max(stacked_kernels.shape[0],stacked_kernels.shape[1])))
 
+		lamb=self.decompose_pars.get('lamb',1/torch.sqrt(torch.max(torch.tensor(stacked_kernels.shape))))
+		tol=self.decompose_pars.get('tol',1e-7)
+		max_iter=self.decompose_pars.get('max_iter',500)
+		debug=self.decompose_pars.get('debug',True)
 
-		# change to torch
-		stacked_kernels=stacked_kernels.clone().detach().numpy()
-		B=np.zeros(stacked_kernels.shape)
-		A=np.zeros(stacked_kernels.shape)
-		D=np.zeros(stacked_kernels.shape)
+		# # change to torch
+		# if torch.is_tensor(mu):
+		# 	mu=mu.clone().detach().numpy()
+		# if torch.is_tensor(lamb):
+		# 	lamb=lamb.clone().detach().numpy()
+
+		# stacked_kernels=stacked_kernels.clone().detach().numpy()
+		# B=np.zeros(stacked_kernels.shape)
+		# A=np.zeros(stacked_kernels.shape)
+		# D=np.zeros(stacked_kernels.shape)
+		B=torch.zeros(stacked_kernels.shape)
+		A=torch.zeros(stacked_kernels.shape)
+		M=torch.zeros(stacked_kernels.shape)
 
 		rank=0
 		err=tol+1
 		ite=0
-		while (err>tol) and (ite<max_iter):
-			err_denominator = np.linalg.norm(np.concatenate((B,A), axis=1), 'fro') 
-            
-			F=D/mu + self.P
-            
-			# B - subproblem
-			E = F - A;
-			dB = B;       
-			U, sigmas, V = np.linalg.svd(E, full_matrices=False);
-			rank = (sigmas > 1/mu).sum()
-			Sigma = np.diag(sigmas[0:rank] - 1/mu)
-			B = np.dot(np.dot(U[:,0:rank], Sigma), V[0:rank,:])
-			dB = B - dB
-            
+		while ite<max_iter: # and  err>tol:        
+			# B - subproblem  
+			# U, sigmas, V = np.linalg.svd(stacked_kernels - A + M/mu, full_matrices=False);
+			# rank = (sigmas > 1/mu).sum()
+			# Sigma = np.diag(sigmas[0:rank] - 1/mu)
+			# B = np.dot(np.dot(U[:,0:rank], Sigma), V[0:rank,:])
+			U, S, Vt = torch.linalg.svd(stacked_kernels-A+(1/mu)*M,full_matrices=False)
+			B=torch.matmul(U, torch.matmul(torch.diag(torch.nn.Softshrink(1/mu)(S)), Vt))
+
 			# A - subproblem 
-			E = F - B
-			dA = A
-			A = proxl1(E,lamb/mu) 
-			dA = A - dA
+			# A = torch.nn.Softshrink(lamb/mu)(torch.from_numpy(stacked_kernels - B + M/mu)).clone().detach().numpy() 
+			A=torch.nn.Softshrink(lamb/mu)(stacked_kernels-B+(1/mu)*M)
             
 			# Update Lambda (dual variable)
-			Z = self.P - A - B
-			D = D + mu*Z
+			# M = M + mu*(stacked_kernels - A - B)
+			M=M+mu*(stacked_kernels-B-A)
             
 			# err
-			err = np.linalg.norm(np.concatenate((dB, dA), axis=1), 'fro') / (err_denominator + 1)
+			err=torch.norm(stacked_kernels-B-A,p='fro')/torch.norm(stacked_kernels,p='fro')
             
-			if debug==True:
-			print('ite=',ite,'. err=',err)
+			if debug is True:
+				print('ite=',ite,'. err=',err)
             
 			# update ite
 			ite=ite+1
@@ -649,14 +687,26 @@ class DecomposeLattice(Lattice):
 		print('mu=',mu,'. lamb=',lamb,'. rank=',rank)
   
 		# pca fit
-		if r is None:
-			r=rank
-		# st=B
+		# stacked_kernels=B.copy()
 
-		self.stacked_kernels()
+		# create new copy lattice
+		bg_input_lattice=copy.deepcopy(input_lattice)
 
-		decompose_pars={'r':r}
-		self._pca()
+		# to torch
+		# stacked_kernels=torch.from_numpy(B.copy())
+		stacked_kernels=B.clone()
+
+		# denormalize
+		# stacked_kernels=stacked_kernels*(ma-mi)+mi	
+
+		# copy bg component to the new lattice
+		bg_input_lattice.unstack_kernels(stacked_kernels)
+		
+		# run pca 
+		self.rank=rank
+		pca_decompose_pars={'r':self.decompose_pars.get('r',self.rank-1)}
+		self.decompose_pars=pca_decompose_pars
+		self._pca(bg_input_lattice)
 
 
 ''' 
@@ -818,6 +868,22 @@ def normalize(x,a=0.0,b=1.0):
 		rx=x*0.0 + (mi+ma)/2
 
 	return rx
+
+# salt and pepper noise
+def spnoise(img, amount=0.5, s_vs_p=0.5):
+	out = img.clone()
+	amount = torch.tensor(amount, dtype=torch.float64)
+	s_vs_p = torch.tensor(s_vs_p, dtype=torch.float64)
+	# salt
+	num_salt = torch.ceil(amount * torch.numel(img) * s_vs_p).int()
+	coords = [torch.randint(0, i - 1, (num_salt,)) for i in img.shape]
+	out[tuple(coords)] = torch.max(img) #1
+	# pepper
+	num_pepper = torch.ceil(amount * torch.numel(img) * (1. - s_vs_p)).int()
+	coords = [torch.randint(0, i - 1, (num_pepper,)) for i in img.shape]
+	out[tuple(coords)] = torch.min(img) #0
+	return out
+
 
 # unravel_index
 def unravel_multi_index(index, shape):
