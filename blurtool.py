@@ -230,6 +230,7 @@ class NonstationaryBlur(Blur):
 			# create a blur object using the current padded eigenkernel
 			eigenkernel_data=self.lattice.eigenkernels[c]()
 			padded_eigenkernel_data=pad(eigenkernel_data,pad_shape)
+
 			padded_eigenkernel=Kernel(self.shape,psf_data=padded_eigenkernel_data,mode='from_data')
 			stat_blur=StationaryBlur(padded_eigenkernel)
 
@@ -397,7 +398,7 @@ class Lattice:
 		# TODO: fix number of pools
 		if blur is True:
 			test_blur=NonstationaryBlur(self)
-			test_grid=test_blur.forward(test_grid,n_pool=4)
+			test_grid=test_blur.forward(test_grid,n_pool=1)
 
 		if return_table is True:
 			return test_grid,(table_i,table_j)
@@ -409,7 +410,7 @@ class Lattice:
 	# WARNING: i don't recommend runnning this if self.shape is too big, since it stores the kernel.__call__() data for all kernels. 
 	#		  the correct way to do it, is to sample the big lattice into a smaller one, and only then stacking the sampled kernels 
 	# 		  to be decomposed.	 
-	def stack_kernels(self):
+	def stack_kernels(self,normalize=False):
 
 		# allocate memory
 		stacked_kernels=torch.zeros((self.kernel_shape[0]*self.kernel_shape[1],self.shape[0]*self.shape[1]))
@@ -419,7 +420,14 @@ class Lattice:
 			for j in range(self.shape[1]):
 				pos=(i,j)
 				raveled_pos=ravel_multi_index((i,j),(self.shape[0],self.shape[1]))
-				stacked_kernels[:,raveled_pos]=self.kernel(pos)().reshape(self.kernel_shape[0]*self.kernel_shape[1])
+				kernel_data=self.kernel(pos)().reshape(self.kernel_shape[0]*self.kernel_shape[1])
+                
+                # normalize
+				if normalize is True:
+					kernel_data=normalize_area(kernel_data)
+                
+                # stack
+				stacked_kernels[:,raveled_pos]=kernel_data
 
 		return stacked_kernels
 
@@ -440,6 +448,7 @@ class Lattice:
 				pos=(i,j)
 				ravaled_pos=ravel_multi_index((i,j),(self.shape[0],self.shape[1]))
 				psf_data=stacked_kernels[:,ravaled_pos].reshape(self.kernel_shape[0],self.kernel_shape[1])
+                
 				kernel=Kernel(self.kernel_shape,mode='from_data',psf_data=psf_data)
 				kernels[pos]=kernel
 
@@ -568,13 +577,14 @@ class DecomposeLattice(Lattice):
 
 		# unpack decompose_pars
 		rank=self.decompose_pars.get('r',input_lattice.shape[0]*input_lattice.shape[1])
+		normalize_input_psf=self.decompose_pars.get('normalize_input_psf',True)
 
 		# mean bias is stored in the last element, so add one to rank
 		self.rank=rank+1
 
 		# stack input kernels and normalize 
 		#stacked_kernels=normalize(input_lattice.stack_kernels())
-		stacked_kernels=input_lattice.stack_kernels()
+		stacked_kernels=input_lattice.stack_kernels(normalize=normalize_input_psf)
 
 		# store and subtract the mean kernel of each (stacked) kernel
 		# TODO: check if that's correct again
