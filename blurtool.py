@@ -100,7 +100,7 @@ class StationaryBlur(Blur):
 NonstationaryBlur class. 
 '''
 class NonstationaryBlur(Blur):
-	def __init__(self,lattice):
+	def __init__(self,lattice,approx=True):
 		super().__init__()
 	
 		# this holds the module's parameters, which is necessary for proper initialization of the nn.Module object 
@@ -117,6 +117,13 @@ class NonstationaryBlur(Blur):
 			self._forward=self._forward_decomposed
 		else:
 			self._forward=self._forward_nondecomposed
+
+			# set forward nondecomposed method
+			self.approx=approx
+			if approx is True:
+				self._multi_forwardfun=self._multi_forwardfun_approx
+			else:
+				self._multi_forwardfun=self._multi_forwardfun_lsvc
 
 	# nonstationary blur can for forwarded in a different ways depending whether self.lattice is decomposed or not. 
 	# since kernels are computed using eigenkernels normally when the lattice is decomposed, it would be fine to just 
@@ -176,7 +183,7 @@ class NonstationaryBlur(Blur):
 
 
 	# function to be mapped into pool
-	def _multi_forwardfun(self,args):
+	def _multi_forwardfun_approx(self,args):
 		# unpack parameters
 		i,j,k=args
 		pos=[j,k]
@@ -192,6 +199,27 @@ class NonstationaryBlur(Blur):
 
 		return yijk
 
+	# function to be mapped into pool. This implements the original Linear Space-Variant (LSV) convolution approach in parallel
+	def _multi_forwardfun_lsvc(self,args):
+		# unpack parameters
+		i,j,k=args
+		pos=[j,k]
+		
+		# define operands
+		x_window=crop_around(self._temp_x[i,:,:].squeeze(),self.lattice.kernel_shape,pos=pos)
+		w0,w1=self.lattice.kernel_shape[0]//2,self.lattice.kernel_shape[1]//2
+
+
+		yijk=0
+		for alpha in torch.arange(-w0,w0+1):
+			for beta in torch.arange(-w1,w1+1):
+				# define kernel of current position
+				kernel=self.lattice.kernel((j+alpha,k+beta))()
+
+				# apply convolution in spatial domain
+				yijk=yijk+x_window[w0+alpha,w1+beta]*(kernel[w0-alpha,w1-beta])
+
+		return yijk
 
 	# decomposed forward method
 	def _forward_decomposed(self,x,n_pool=1,debug=False):
@@ -218,12 +246,13 @@ Kernel class
 '''
 
 class Kernel:
-	def __init__(self,shape,mode='gaussian',psf_pars=None,psf_data=None,eps=1e-5):
+	def __init__(self,shape,mode='gaussian',psf_pars=None,psf_data=None,eps=1e-5,normalize=False):
 		self.shape=shape
 		self.mode=mode
 		self.psf_pars=psf_pars
 		self.eps=eps
 		self.psf_data=psf_data
+		self.normalize=normalize
 		
 		# passing mode='from_data' is not necessary if psf_data is set
 		if self.psf_data is not None:
@@ -232,23 +261,25 @@ class Kernel:
 	def __call__(self):
 		if self.mode=='gaussian':
 			kernel=self._gaussian()
+			self.normalize=True
 		elif self.mode=='from_data':
 			kernel=self.psf_data	
 		else:
 			raise TypeError('Unrecognized mode in Kernel')
 	
-		return kernel
-	
+		if self.normalize is False:
+			return kernel 
+		else: 
+			return normalize_area(kernel)
 	
 	# 2d rotated gaussian model 
 	def _gaussian(self):
 		# unpack parameters
-		sx=torch.tensor(self.psf_pars.get('sx',0.1))
-		sy=torch.tensor(self.psf_pars.get('sy',0.1))
+		sx=self.psf_pars.get('sx',torch.tensor(0.1))
+		sy=self.psf_pars.get('sy',torch.tensor(0.1))
 		angle=self.psf_pars.get('angle',45.0)
-		mx=torch.tensor(self.psf_pars.get('mx',0.0))
-		my=torch.tensor(self.psf_pars.get('my',0.0))
-
+		mx=self.psf_pars.get('mx',torch.tensor(0.0))
+		my=self.psf_pars.get('my',torch.tensor(0.0))
 
 		# initialize gaussian kernel with zeros
 		gaussian_kernel=torch.zeros(self.shape).double()
@@ -519,6 +550,7 @@ class DecomposeLattice(Lattice):
 		for c in range(self.rank):
 			psf_data=psf_data+self.eigencoefs[c][pos].item()*self.eigenkernels[c]()
 
+		
 		return Kernel(self.kernel_shape,psf_data=psf_data,mode='from_data')
 
 	def noninterpolated_kernel(self,pos):
@@ -565,13 +597,18 @@ class DecomposeLattice(Lattice):
 		U,D,Vt=scipy.linalg.svd(stacked_kernels.clone().detach().numpy())     
 		stacked_eigenkernels=torch.from_numpy(U[:,:self.rank])
 		stacked_noninterpolated_coefs=torch.from_numpy((np.diag(D[:self.rank]).dot(Vt[:self.rank,:])).transpose())
+		D=torch.from_numpy(D)
+
+		# U,D,Vt=torch.linalg.svd(stacked_kernels,full_matrices=True)
+		# stacked_eigenkernels=U[:,:self.rank]
+		# stacked_noninterpolated_coefs=torch.diag(D[:self.rank]).matmul(Vt[:self.rank,:]).t()
 
 		# insert mean kernel information at the begining 
 		stacked_ones_coefs=torch.ones(self.input_lattice_shape[0]*self.input_lattice_shape[1],1)
 		stacked_noninterpolated_coefs=torch.cat((stacked_ones_coefs,stacked_noninterpolated_coefs),dim=1)
-
 		stacked_mean_kernel=stacked_mean_kernel.reshape(self.kernel_shape[0]*self.kernel_shape[1],1)
 		stacked_eigenkernels=torch.cat((stacked_mean_kernel,stacked_eigenkernels),dim=1)
+
 
 		# set self.eigenkernels
 		self.unstack_eigenkernels(stacked_eigenkernels)
@@ -614,7 +651,7 @@ class DecomposeLattice(Lattice):
 		self.noninterpolated_eigencoefs=noninterpolated_coefs
 
 		# set singular values
-		self.eigenvals=torch.tensor(D[:self.rank],dtype=torch.float64)
+		self.eigenvals=D[:self.rank]
 
 		# set decomposed flag to True
 		self.decomposed=True
@@ -632,24 +669,12 @@ class DecomposeLattice(Lattice):
 		# stacked_kernels=(stacked_kernels-mi)/(ma-mi)
 
 		# unpack decompose_pars
-		# mu=self.decompose_pars.get('mu',0.25/torch.abs(torch.mean(stacked_kernels)))
 		mu=self.decompose_pars.get('mu',0.25/torch.abs(torch.mean(stacked_kernels)))
-
 		lamb=self.decompose_pars.get('lamb',1/torch.sqrt(torch.max(torch.tensor(stacked_kernels.shape))))
 		tol=self.decompose_pars.get('tol',1e-7)
 		max_iter=self.decompose_pars.get('max_iter',500)
 		debug=self.decompose_pars.get('debug',True)
 
-		# # change to torch
-		# if torch.is_tensor(mu):
-		# 	mu=mu.clone().detach().numpy()
-		# if torch.is_tensor(lamb):
-		# 	lamb=lamb.clone().detach().numpy()
-
-		# stacked_kernels=stacked_kernels.clone().detach().numpy()
-		# B=np.zeros(stacked_kernels.shape)
-		# A=np.zeros(stacked_kernels.shape)
-		# D=np.zeros(stacked_kernels.shape)
 		B=torch.zeros(stacked_kernels.shape)
 		A=torch.zeros(stacked_kernels.shape)
 		M=torch.zeros(stacked_kernels.shape)
@@ -659,19 +684,13 @@ class DecomposeLattice(Lattice):
 		ite=0
 		while ite<max_iter: # and  err>tol:        
 			# B - subproblem  
-			# U, sigmas, V = np.linalg.svd(stacked_kernels - A + M/mu, full_matrices=False);
-			# rank = (sigmas > 1/mu).sum()
-			# Sigma = np.diag(sigmas[0:rank] - 1/mu)
-			# B = np.dot(np.dot(U[:,0:rank], Sigma), V[0:rank,:])
 			U, S, Vt = torch.linalg.svd(stacked_kernels-A+(1/mu)*M,full_matrices=False)
 			B=torch.matmul(U, torch.matmul(torch.diag(torch.nn.Softshrink(1/mu)(S)), Vt))
 
-			# A - subproblem 
-			# A = torch.nn.Softshrink(lamb/mu)(torch.from_numpy(stacked_kernels - B + M/mu)).clone().detach().numpy() 
+			# A - subproblem  
 			A=torch.nn.Softshrink(lamb/mu)(stacked_kernels-B+(1/mu)*M)
             
 			# Update Lambda (dual variable)
-			# M = M + mu*(stacked_kernels - A - B)
 			M=M+mu*(stacked_kernels-B-A)
             
 			# err
@@ -856,7 +875,7 @@ def crop_around(h,crop_shape,pos=None):
 
 # [min,max] normalization 
 # normalize x in [a,b].
-def normalize(x,a=0.0,b=1.0):
+def normalize_minmax(x,a=0.0,b=1.0):
 	mi=torch.min(x)
 	ma=torch.max(x)
 	if ma>mi:
@@ -868,6 +887,10 @@ def normalize(x,a=0.0,b=1.0):
 		rx=x*0.0 + (mi+ma)/2
 
 	return rx
+
+# area normalization
+def normalize_area(x,area=1):
+	return (area*x)/torch.sum(torch.abs(x))
 
 # salt and pepper noise
 def spnoise(img, amount=0.5, s_vs_p=0.5):
@@ -917,3 +940,10 @@ def psnr(original, compressed):
     max_pixel = 1.0
     psnr = 20 * torch.log10(max_pixel / torch.sqrt(mse))
     return psnr
+
+# SSIM score wrapper
+# TODO: implement with torch
+def ssim(original,compressed):
+	from skimage.metrics import structural_similarity
+	score=structural_similarity(original.clone().detach().numpy(),compressed.clone().detach().numpy())
+	return torch.tensor(score)
