@@ -159,25 +159,26 @@ class NonstationaryBlur(Blur):
 			# store x as an attribute temporarily
 			self._temp_x=x#.clone()
 
-			# yjs=[]
+			yjs=[]
 
-			# # compute each row in parallel using torch.multiprocessing.pool
-			# with mp.get_context("spawn").Pool(n_pool) as pool:
-			# # with mp.Pool(n_pool) as pool: 
-			# 	for j in range(x.shape[1]):
-			# 		args=[(i,j,k) for i in range(x.shape[0]) for k in range(x.shape[2])]
-			# 		yj=torch.tensor(pool.map(self._forward_multi,args)).reshape(x.shape[0],x.shape[2])
-			# 		yjs.append(yj)
-
-			# 		if debug is True:
-			# 			print('finished row ',j)
-
-			# 	y=torch.stack(yjs,dim=1)
-
-			#compute everything in parallel at once using torch.multiprocessing.pool
+			# compute each row in parallel using torch.multiprocessing.pool
 			with mp.get_context("spawn").Pool(n_pool) as pool:
-				args=[(i,j,k) for i in range(x.shape[0]) for j in range(x.shape[1]) for k in range(x.shape[2])]
-				y=torch.tensor(pool.map(self._multi_forwardfun,args)).reshape(x.shape)
+			# with mp.Pool(n_pool) as pool: 
+				for j in range(x.shape[1]):
+					args=[(i,j,k) for i in range(x.shape[0]) for k in range(x.shape[2])]
+					yj=torch.tensor(pool.map(self._multi_forwardfun,args)).reshape(x.shape[0],x.shape[2])
+					yjs.append(yj)
+
+					if debug is True:
+						print('finished row ',j)
+
+				y=torch.stack(yjs,dim=1)
+
+			# #compute everything in parallel at once using torch.multiprocessing.pool
+			# with mp.get_context("spawn").Pool(n_pool) as pool:
+			# 	args=[(i,j,k) for i in range(x.shape[0]) for j in range(x.shape[1]) for k in range(x.shape[2])]
+			# 	y_data=pool.map(self._multi_forwardfun,args)
+			# 	y=torch.tensor(y_data).reshape(x.shape)
 
 		return y
 
@@ -211,13 +212,14 @@ class NonstationaryBlur(Blur):
 
 
 		yijk=0
-		for alpha in torch.arange(-w0,w0+1):
-			for beta in torch.arange(-w1,w1+1):
+		for alpha in torch.arange(-w0,w0+self.lattice.kernel_shape[0]%2): # (-w0,w0+1): (odd)
+			for beta in torch.arange(-w1,w1+self.lattice.kernel_shape[0]%2): # (-w1,w1+1): (odd)
 				# define kernel of current position
 				kernel=self.lattice.kernel((j+alpha,k+beta))()
-
 				# apply convolution in spatial domain
-				yijk=yijk+x_window[w0+alpha,w1+beta]*(kernel[w0-alpha,w1-beta])
+				fix_last_i=(self.lattice.kernel_shape[0]+1)%2
+				fix_last_j=(self.lattice.kernel_shape[1]+1)%2
+				yijk=yijk+x_window[w0+alpha,w1+beta]*(kernel[w0-alpha-fix_last_i,w1-beta-fix_last_j]) # -0,-0 (odd)
 
 		return yijk
 
@@ -247,31 +249,38 @@ Kernel class
 '''
 
 class Kernel:
-	def __init__(self,shape,mode='gaussian',psf_pars=None,psf_data=None,eps=1e-5,normalize=False):
+	def __init__(self,shape,mode='gaussian',psf_pars=None,psf_data=None,eps=1e-5):
 		self.shape=shape
 		self.mode=mode
 		self.psf_pars=psf_pars
 		self.eps=eps
 		self.psf_data=psf_data
-		self.normalize=normalize
 		
 		# passing mode='from_data' is not necessary if psf_data is set
 		if self.psf_data is not None:
 			self.mode='from_data'
 
-	def __call__(self):
+	def __call__(self,normalize=False,normalize_mode='area'):
 		if self.mode=='gaussian':
 			kernel=self._gaussian()
-			self.normalize=True
 		elif self.mode=='from_data':
 			kernel=self.psf_data	
+		elif self.mode=='impulse':
+			kernel=self._impulse()
+		elif self.mode=='zeros':
+			kernel=self._zeros()
 		else:
 			raise TypeError('Unrecognized mode in Kernel')
 	
-		if self.normalize is False:
+		# return kernel without normalization
+		if normalize is False:
 			return kernel 
-		else: 
-			return normalize_area(kernel)
+		else:
+			# return normalized kernel
+			if normalize_mode=='area':
+				return normalize_area(kernel)
+			elif normalize_mode=='minmax':
+				return normalize_minmax(kernel)
 	
 	# 2d rotated gaussian model 
 	def _gaussian(self):
@@ -281,6 +290,7 @@ class Kernel:
 		angle=self.psf_pars.get('angle',45.0)
 		mx=self.psf_pars.get('mx',torch.tensor(0.0))
 		my=self.psf_pars.get('my',torch.tensor(0.0))
+		normalize=self.psf_pars.get('normalize',True)
 
 		# initialize gaussian kernel with zeros
 		gaussian_kernel=torch.zeros(self.shape).double()
@@ -298,7 +308,25 @@ class Kernel:
 		rotated_kernel=scipy.ndimage.rotate(gaussian_kernel.detach().clone().numpy(),angle,mode='nearest',reshape=False).transpose()
 		rotated_kernel=torch.tensor(rotated_kernel).double()
 
+		# each gaussian kernel is a density function, so we usually normalize its area to one.
+		if normalize is True:
+			rotated_kernel=normalize_area(rotated_kernel)
+
 		return rotated_kernel 
+
+	# TODO: test this
+	def _impulse(self):
+		# find center point
+		cent_i=int(round(self.shape[0]/2))
+		cent_j=int(round(self.shape[1]/2))
+
+		kernel_data=torch.zeros(self.shape)
+		kernel_data[cent_i,cent_j]=1
+		return kernel_data
+
+	# TODO: Test this
+	def _zeros(self):
+		return torch.zeros(self.shape)
 
 
 '''
@@ -334,11 +362,12 @@ class Lattice:
 	# this method returns a sampled lattice of shape sampled_shape whose kernels are 
 	# regularly sampled from the current lattice.
 	# sample_mode may be 'deep_copy' for copying the original Kernel objects, not only their reference. 
-	# or 'copy_data', which also creates new Kernel objects, but using 'from_data' Kernel psf_mode.
+	# or 'copy_from_data', which also creates new Kernel objects, but using 'from_data' Kernel psf_mode.
+	# WARNING: normalize/normalize_mode only works for 'copy_from_data' mode. 
 	# TODO: unit test of sample regularity 
-	def sample(self,sampled_shape,sample_mode='copy_from_data'):
+	def sample(self,sampled_shape,sample_mode='copy_from_data',normalize=False,normalize_mode='minmax',margin=0):
 		# cast a grid of the same img_shape as the current lattice, but using the new sampled lattice shape
-		sample_grid,table=self.grid(sampled_shape,return_table=True)
+		sample_grid,table=self.grid(sampled_shape,return_table=True,margin=margin)
 		table_i,table_j=table
 
 		# define sampled kernels
@@ -353,7 +382,7 @@ class Lattice:
 				if sample_mode=='deep_copy':
 					sampled_kernels[(i,j)]=copy.deepcopy(self.kernel(sampled_pos))
 				if sample_mode=='copy_from_data':
-					psf_data=self.kernel(sampled_pos)()
+					psf_data=self.kernel(sampled_pos)(normalize=normalize,normalize_mode=normalize_mode)
 					sampled_kernels[(i,j)]=Kernel(self.kernel_shape,psf_data=psf_data,mode='from_data')
 
 
@@ -364,9 +393,57 @@ class Lattice:
 
 		return sampled_lattice
 
+
 	# this is the function the properly draws a test grid
 	# if return_table is True, it returns the table needed for lattice sampling.
-	def grid(self,sampled_shape,return_table=False,blur=False):
+	def grid(self,sampled_shape,return_table=False,blur=False,normalize=False,margin=0):
+
+		# define output variables
+		table_i=torch.zeros(sampled_shape[0]).int()
+		table_j=torch.zeros(sampled_shape[1]).int()
+		test_grid=torch.zeros(self.shape)
+
+		mod1=int(np.round((self.shape[0]-2*margin)/sampled_shape[0]))
+		mod2=int(np.round((self.shape[1]-2*margin)/sampled_shape[1]))
+
+		# find center point
+		cent_i=(mod1)//2
+		cent_j=(mod2)//2
+		for si in range(sampled_shape[0]):
+			i=margin+max(cent_i*(2*si+1)-1,si) # this -1 changes the center position 
+			table_i[si]=i
+			for sj in range(sampled_shape[1]):
+				j=margin+max(cent_j*(2*sj+1)-1,sj) # this -1 changes the center position 
+				table_j[sj]=j
+				test_grid[i,j]=1
+
+		# return blurred test grid if needed
+		if blur is True:
+			if normalize is False:
+				# test blur
+				test_blur=NonstationaryBlur(self)
+			else:
+				# sample table points
+				sampled_lat=self.sample(sampled_shape,normalize=True,normalize_mode='minmax')
+
+				# interpolate 
+				view_sampled_lat=InterpolateLattice(sampled_lat,self.shape)
+
+				# test blur 
+				test_blur=NonstationaryBlur(view_sampled_lat)
+
+			# blur test grid 
+			test_grid=test_blur.forward(test_grid,n_pool=8)	
+
+
+		if return_table is True:
+			return test_grid,(table_i,table_j)
+		else:
+			return test_grid
+
+	# this is the function also draws a test grid, but with a slightly larger margin than the first function.
+	# if return_table is True, it returns the table needed for lattice sampling.
+	def grid_other(self,sampled_shape,return_table=False,blur=False):
 
 		# define output variables
 		table_i=torch.zeros(sampled_shape[0]).int()
@@ -391,9 +468,6 @@ class Lattice:
 			if line_sum==sampled_shape[1]:
 				column_sum+=1
 
-			# self.table_i=self.table_i.astype(int)
-			# self.table_j=self.table_j.astype(int)
-
 		# return blurred test grid if needed
 		# TODO: fix number of pools
 		if blur is True:
@@ -407,6 +481,7 @@ class Lattice:
 
 
 	# stack kernels into a matrix of the form [kernel_shape[0]*kernel_shape[1],self.shape[0]*self.shape[1]]
+	# We usually want to stack the kernels with normalized area. In order to do that, set normalize=True
 	# WARNING: i don't recommend runnning this if self.shape is too big, since it stores the kernel.__call__() data for all kernels. 
 	#		  the correct way to do it, is to sample the big lattice into a smaller one, and only then stacking the sampled kernels 
 	# 		  to be decomposed.	 
@@ -420,12 +495,8 @@ class Lattice:
 			for j in range(self.shape[1]):
 				pos=(i,j)
 				raveled_pos=ravel_multi_index((i,j),(self.shape[0],self.shape[1]))
-				kernel_data=self.kernel(pos)().reshape(self.kernel_shape[0]*self.kernel_shape[1])
-                
-                # normalize
-				if normalize is True:
-					kernel_data=normalize_area(kernel_data)
-                
+				kernel_data=self.kernel(pos)(normalize=normalize).reshape(self.kernel_shape[0]*self.kernel_shape[1])
+
                 # stack
 				stacked_kernels[:,raveled_pos]=kernel_data
 
@@ -471,8 +542,8 @@ class RotGaussian(Lattice):
 		self.kernel_shape=kernel_shape
 
 		# find center point
-		self.cent_i=int(np.round(self.shape[0]/2))
-		self.cent_j=int(np.round(self.shape[1]/2))
+		self.cent_i=int(round(self.shape[0]/2))
+		self.cent_j=int(round(self.shape[1]/2))
 		
 		# half diagonal length normalization 
 		self.half_diag_length=np.sqrt(self.cent_i**2 + self.cent_j**2)
@@ -503,6 +574,41 @@ class RotGaussian(Lattice):
 		psf_pars={'sx':sx,'sy':sy,'angle':theta}
 
 		return Kernel(self.kernel_shape,mode='gaussian',psf_pars=psf_pars)
+
+
+'''
+InterpolateLattice subclass
+modes: 
+ + 'zero_dummy': zero order dummy interpolation. This mode only places a kernel at tabled positions of a grid.
+ 		     if the requested position is not in table, it finds the closest position in the table and uses it.
+'''
+class InterpolateLattice(Lattice):
+	def __init__(self,input_lattice,img_shape,mode='zero_dummy'):
+		super().__init__(img_shape,kernel_shape=input_lattice.kernel_shape)
+
+		self.input_lattice=input_lattice
+
+		if mode=='zero_dummy':
+			test_grid,(table_i,table_j)=self.grid(input_lattice.shape,return_table=True)
+			self.table_i=table_i
+			self.table_j=table_j
+			self.table_points=[(i,j) for i in table_i for j in table_j]
+			self.kernel=self._kernel_zero_dummy
+		else:
+			raise TypeError('Unrecognized mode in InterpolateLattice')
+
+	def _kernel_zero_dummy(self,pos):
+		# unpack position and verify if it is a valid one
+		i,j=pos
+		if (i in self.table_i) and (j in self.table_j):
+			# find out the sampled pos directly
+			sampled_pos=(list(self.table_i).index(i),list(self.table_j).index(j))
+		else:
+			# find out the closest sampled pos 
+			i,j=closest_coordinate(self.table_points,pos)
+			sampled_pos=(list(self.table_i).index(i),list(self.table_j).index(j))
+		
+		return self.input_lattice.kernel(sampled_pos)
 
 
 '''
@@ -571,7 +677,7 @@ class DecomposeLattice(Lattice):
 		return Kernel(self.kernel_shape,psf_data=psf_data,mode='from_data')
 
 
-	# return a lattice whose kernels are the eigenkernels of self.kernels 
+	# returns a lattice whose kernels are the eigenkernels of self.kernels 
 	def _pca(self,input_lattice):
 		# check if it's already decomposed
 
@@ -580,10 +686,9 @@ class DecomposeLattice(Lattice):
 		normalize_input_psf=self.decompose_pars.get('normalize_input_psf',True)
 
 		# mean bias is stored in the last element, so add one to rank
-		self.rank=rank+1
+		self.rank=rank
 
-		# stack input kernels and normalize 
-		#stacked_kernels=normalize(input_lattice.stack_kernels())
+		# stack input kernels. Default is to normalize all input kernels area to one.
 		stacked_kernels=input_lattice.stack_kernels(normalize=normalize_input_psf)
 
 		# store and subtract the mean kernel of each (stacked) kernel
@@ -603,22 +708,23 @@ class DecomposeLattice(Lattice):
 		stacked_coefs=torch.zeros((self.kernel_shape[0]*self.kernel_shape[1],self.rank+1))
         
 		# run SVD
-		# TODO: use torch.
-		U,D,Vt=scipy.linalg.svd(stacked_kernels.clone().detach().numpy())     
-		stacked_eigenkernels=torch.from_numpy(U[:,:self.rank])
-		stacked_noninterpolated_coefs=torch.from_numpy((np.diag(D[:self.rank]).dot(Vt[:self.rank,:])).transpose())
-		D=torch.from_numpy(D)
-
-		# U,D,Vt=torch.linalg.svd(stacked_kernels,full_matrices=True)
-		# stacked_eigenkernels=U[:,:self.rank]
-		# stacked_noninterpolated_coefs=torch.diag(D[:self.rank]).matmul(Vt[:self.rank,:]).t()
+		U,D,Vt=torch.linalg.svd(stacked_kernels,full_matrices=True)
+		stacked_eigenkernels=U[:,:self.rank]
+		stacked_noninterpolated_coefs=torch.diag(D[:self.rank]).matmul(Vt[:self.rank,:]).t()
+		singularvalues=D.clone()
 
 		# insert mean kernel information at the begining 
 		stacked_ones_coefs=torch.ones(self.input_lattice_shape[0]*self.input_lattice_shape[1],1)
 		stacked_noninterpolated_coefs=torch.cat((stacked_ones_coefs,stacked_noninterpolated_coefs),dim=1)
 		stacked_mean_kernel=stacked_mean_kernel.reshape(self.kernel_shape[0]*self.kernel_shape[1],1)
 		stacked_eigenkernels=torch.cat((stacked_mean_kernel,stacked_eigenkernels),dim=1)
+		singularvalues=torch.cat((torch.ones(1),singularvalues),dim=0)
 
+		# fix rank
+		self.rank=rank+1
+
+		# set self.singularvalues
+		self.singularvalues=singularvalues
 
 		# set self.eigenkernels
 		self.unstack_eigenkernels(stacked_eigenkernels)
@@ -660,9 +766,6 @@ class DecomposeLattice(Lattice):
 		self.eigencoefs=coefs
 		self.noninterpolated_eigencoefs=noninterpolated_coefs
 
-		# set singular values
-		self.eigenvals=D[:self.rank]
-
 		# set decomposed flag to True
 		self.decomposed=True
 
@@ -672,11 +775,6 @@ class DecomposeLattice(Lattice):
 
 		# stack kernels
 		stacked_kernels=input_lattice.stack_kernels()
-
-
-		# normalize 
-		# mi,ma=torch.min(stacked_kernels),torch.max(stacked_kernels)
-		# stacked_kernels=(stacked_kernels-mi)/(ma-mi)
 
 		# unpack decompose_pars
 		mu=self.decompose_pars.get('mu',0.25/torch.abs(torch.mean(stacked_kernels)))
@@ -724,9 +822,6 @@ class DecomposeLattice(Lattice):
 		# to torch
 		# stacked_kernels=torch.from_numpy(B.copy())
 		stacked_kernels=B.clone()
-
-		# denormalize
-		# stacked_kernels=stacked_kernels*(ma-mi)+mi	
 
 		# copy bg component to the new lattice
 		bg_input_lattice.unstack_kernels(stacked_kernels)
@@ -903,18 +998,29 @@ def normalize_area(x,area=1):
 	return (area*x)/torch.sum(torch.abs(x))
 
 # salt and pepper noise
-def spnoise(img, amount=0.5, s_vs_p=0.5):
+def spnoise(img, amount=0.5, s_vs_p=0.5,salt_val=None,pepper_val=None):
 	out = img.clone()
 	amount = torch.tensor(amount, dtype=torch.float64)
 	s_vs_p = torch.tensor(s_vs_p, dtype=torch.float64)
+
 	# salt
 	num_salt = torch.ceil(amount * torch.numel(img) * s_vs_p).int()
 	coords = [torch.randint(0, i - 1, (num_salt,)) for i in img.shape]
-	out[tuple(coords)] = torch.max(img) #1
+
+	if salt_val is None:
+		out[tuple(coords)] = torch.max(img)
+	else:
+		out[tuple(coords)] = salt_val
+
 	# pepper
 	num_pepper = torch.ceil(amount * torch.numel(img) * (1. - s_vs_p)).int()
 	coords = [torch.randint(0, i - 1, (num_pepper,)) for i in img.shape]
-	out[tuple(coords)] = torch.min(img) #0
+
+	if pepper_val is None:
+		out[tuple(coords)] = torch.min(img)
+	else:
+		out[tuple(coords)] = pepper_val
+
 	return out
 
 
@@ -957,3 +1063,9 @@ def ssim(original,compressed):
 	from skimage.metrics import structural_similarity
 	score=structural_similarity(original.clone().detach().numpy(),compressed.clone().detach().numpy())
 	return torch.tensor(score)
+
+# TODO: implement with torch
+def closest_coordinate(nodes,node):
+	from scipy.spatial import distance
+	closest_index = distance.cdist(np.array(nodes),np.array([node])).argmin()
+	return nodes[closest_index]
