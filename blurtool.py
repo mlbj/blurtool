@@ -34,10 +34,11 @@ class Blur(nn.Module):
 	# to-do: transform time measuring and batch handling into function decorators
 	# x.shape: (batch_size,fig_shape[0],fig_shape[1]) 
 	# y.shape: (batch_size,fig_shape[0],fig_shape[1])
-	def forward(self,x,n_pool=1,debug=False):
+	def forward(self,x,conjugate=False,n_pool=1,debug=False):
         	# start timer
 		start = timer()
-    		
+
+
 		# make sure input is float64
 		x=x.double()
 
@@ -49,7 +50,7 @@ class Blur(nn.Module):
 			x=x.unsqueeze(0)
 
         	# call internal forward method 
-		y=self._forward(x,n_pool=n_pool,debug=debug)
+		y=self._forward(x,conjugate=conjugate,n_pool=n_pool,debug=debug)
         
 		# update timer
 		end = timer()    
@@ -60,7 +61,7 @@ class Blur(nn.Module):
 		return y.reshape(og_x_shape)
 		
 	# specific internal forward method
-	def _forward(self,x):
+	def _forward(self,x,conjugate=False):
 		return None
 		
 
@@ -80,12 +81,15 @@ class StationaryBlur(Blur):
 
 		self.kernel=kernel
 
-	def _forward(self,x,n_pool=1,debug=False):
+	def _forward(self,x,conjugate=False,n_pool=1,debug=False):
 		pad_width=[x.shape[1]-self.kernel.shape[0],x.shape[2]-self.kernel.shape[1]]
 		shifted_padded_kernel=cshift(pad(self.kernel(),pad_width))
 
 		fft_x = torch.fft.fftn(x)
-		fft_shifted_padded_kernel = torch.fft.fftn(shifted_padded_kernel, s=x.shape[-2:])
+		if conjugate is False:
+			fft_shifted_padded_kernel = torch.fft.fftn(shifted_padded_kernel, s=x.shape[-2:])
+		else: 
+			fft_shifted_padded_kernel = torch.conj(torch.fft.fftn(shifted_padded_kernel, s=x.shape[-2:]))
 		fft_product = fft_x*fft_shifted_padded_kernel
 		x_conv_kernel = torch.fft.ifftn(fft_product).real
 		return x_conv_kernel
@@ -128,7 +132,7 @@ class NonstationaryBlur(Blur):
 	# nonstationary blur can for forwarded in a different ways depending whether self.lattice is decomposed or not. 
 	# since kernels are computed using eigenkernels normally when the lattice is decomposed, it would be fine to just 
 	# use the _forward_nondecomposed always. however, for decomposed lattices, _forward_decomposed is way faster.
-	def _forward_nondecomposed(self,x,n_pool=1,debug=False):
+	def _forward_nondecomposed(self,x,conjugate=False,n_pool=1,debug=False):
 		y=torch.zeros(x.shape)
 
 		# linear forward
@@ -224,7 +228,7 @@ class NonstationaryBlur(Blur):
 		return yijk
 
 	# decomposed forward method
-	def _forward_decomposed(self,x,n_pool=1,debug=False):
+	def _forward_decomposed(self,x,conjugate=False,n_pool=1,debug=False):
 		y=torch.zeros(x.shape)
 		pad_shape=(x.shape[1]-self.lattice.kernel_shape[0],x.shape[2]-self.lattice.kernel_shape[1])
 
@@ -240,7 +244,11 @@ class NonstationaryBlur(Blur):
 			coef=self.lattice.eigencoefs[c]
 
 			# define a stationary blur and operate
-			y=y+stat_blur.forward(coef*x)
+			if conjugate is False:
+				y=y+coef*stat_blur.forward(x,conjugate=conjugate)
+			elif conjugate is True:
+				y=y+stat_blur.forward(coef*x,conjugate=conjugate)
+
 
 		return y
 
@@ -778,10 +786,29 @@ class DecomposeLattice(Lattice):
 
 		# unpack decompose_pars
 		mu=self.decompose_pars.get('mu',0.25/torch.abs(torch.mean(stacked_kernels)))
-		lamb=self.decompose_pars.get('lamb',1/torch.sqrt(torch.max(torch.tensor(stacked_kernels.shape))))
 		tol=self.decompose_pars.get('tol',1e-7)
 		max_iter=self.decompose_pars.get('max_iter',500)
 		debug=self.decompose_pars.get('debug',True)
+
+		# set lambda if it was passed in the dictionary of parameters
+		lamb=self.decompose_pars.get('lamb',1/torch.sqrt(torch.max(torch.tensor(stacked_kernels.shape))))
+		
+		# in case lamb is passed as a list 
+		if isinstance(lamb, list):
+			if len(lamb)==self.input_lattice_shape[0]*self.input_lattice_shape[1]:
+				lamb=torch.tensor(lamb).double()
+			else:
+				raise ValueError('lamb argument is a list with incorrect number of elements.')
+
+		else:
+			# in case lamb is passed as a number
+			if type(lamb)==int or type(lamb)==float:
+				lamb=torch.tensor(lamb).double()
+
+			# in the case lamb is a tensor with single element, make it an array with this element repeated
+			if lamb.dim()==0 or (lamb.dim()==1 and lamb.shape[0]==1):
+				lamb=torch.stack([lamb.double() for i in range(self.input_lattice_shape[0]*self.input_lattice_shape[1])]).squeeze()
+
 
 		B=torch.zeros(stacked_kernels.shape)
 		A=torch.zeros(stacked_kernels.shape)
@@ -796,7 +823,12 @@ class DecomposeLattice(Lattice):
 			B=torch.matmul(U, torch.matmul(torch.diag(torch.nn.Softshrink(1/mu)(S)), Vt))
 
 			# A - subproblem  
-			A=torch.nn.Softshrink(lamb/mu)(stacked_kernels-B+(1/mu)*M)
+			# A=torch.nn.Softshrink(lamb/mu)(stacked_kernels-B+(1/mu)*M)
+			# sparse_arg=stacked_kernels-B+(1/mu)*M
+			# new_A=torch.zeros(self.kernel_shape[0]*self.kernel_shape[1],self.shape[1]*self.shape[1])
+			for k in range(self.input_lattice_shape[0]*self.input_lattice_shape[1]):
+				# A[:,k]=torch.nn.Softshrink(lamb[k]/mu)(sparse_arg[:,k])
+				A[:,k]=torch.nn.Softshrink(lamb[k]/mu)(stacked_kernels[:,k]-B[:,k]+(1/mu)*M[:,k])
             
 			# Update Lambda (dual variable)
 			M=M+mu*(stacked_kernels-B-A)
@@ -837,39 +869,84 @@ class DecomposeLattice(Lattice):
 Deblur class. 
 '''
 class Deblur(nn.Module):
-	def __init__(self):
+	def __init__(self,blur,deblur_pars):
 		super().__init__()
-		
-		
+				
+		self.blur=blur
+		self.deblur_pars=deblur_pars
+
 		# misc parameters 
 		self.forward_timer=-1
+
+		# this holds the module's parameters, which is necessary for proper initialization of the nn.Module object 
+		self._modules = {}
 		
 		return 0
 		
 	# y.shape: (batch_size,fig_shape[0],fig_shape[1])
 	# x.shape: (batch_size,fig_shape[0],fig_shape[1]) 
-	def forward(self,x):
+	def forward(self,x,x_true=None,debug=True):
     	# start timer
 		start = timer()
     		
-    		
+		# make sure input is float64
+		x=x.double()
+
+		# store original input shape
+		og_x_shape=x.shape	
+
 		# add a batch dimension to the input, if necessary
 		if x.dim()==2:
 			x=x.unsqueeze(0)
 
         	# call internal forward method 
-		y=self._forward(x)
+		y=self._forward(x,x_true=x_true,debug=debug)
         
 		# update timer
 		end = timer()    
 		self.forward_timer=end-start
-		
+
 		# return
-		return y
+		return y.reshape(og_x_shape)
+		
 		
 	# specific internal forward method
 	def _forward(self,x):
 		return None
+
+class TVGDDeblur(Deblur):
+	def __init__(self,blur,deblur_pars):
+		super().__init__(blur,deblur_pars)
+
+		self.blur=blur
+
+	def _forward(self,y,x_true=None,debug=True):
+    	# unpack parameters
+		niter=self.deblur_pars.get('niter',100)
+		mu=self.deblur_pars.get('mu',torch.tensor(1e-3))
+		lamb=self.deblur_pars.get('lamb',torch.tensor(0.1))
+		x=self.deblur_pars.get('x0',y.clone().detach())
+
+		for ii in range(niter):
+			for d in range(y.shape[0]):
+				si_x = torch.from_numpy(scipy.ndimage.sobel(x[d,:,:].squeeze().clone().detach().numpy(),axis=0,mode='constant')).unsqueeze(0)
+				sj_x = torch.from_numpy(scipy.ndimage.sobel(x[d,:,:].squeeze().clone().detach().numpy(),axis=1,mode='constant')).unsqueeze(0)
+				sx=torch.hypot(si_x,sj_x)
+				norm_sx=torch.norm(sx)
+				si_fun= torch.from_numpy(scipy.ndimage.sobel((sx/norm_sx).clone().detach().numpy(),axis=0,mode='constant'))
+				sj_fun= torch.from_numpy(scipy.ndimage.sobel((sx/norm_sx).clone().detach().numpy(),axis=1,mode='constant'))
+				sfun=torch.hypot(si_fun,sj_fun)
+	                
+				const=self.blur.forward(self.blur.forward(x[d,:,:])-y[d,:,:],conjugate=True) # this outter blur.forward has to be conjugated
+				x[d,:,:]=x[d,:,:]-mu*const-lamb*sfun
+	                
+			if x_true is not None:
+				psnr_score=psnr(x_true,x).item()
+				print('iter: ',ii,'\t PSNR=',psnr_score)
+			else:
+				print('iter: ',ii)
+			 		
+		return x
 
 
 ''' 
@@ -1025,14 +1102,15 @@ def spnoise(img, amount=0.5, s_vs_p=0.5,salt_val=None,pepper_val=None):
 
 
 # unravel_index
-def unravel_multi_index(index, shape):
+# TODO: write and test this
+# def unravel_multi_index(index, shape):
 #  https://discuss.pytorch.org/t/how-to-do-a-unravel-index-in-pytorch-just-like-in-numpy/12987/2
 	# out = []
 	# for dim in reversed(shape):
 	# 	out.append(index % dim)
 	# 	index = index // dim
 	# return tuple(reversed(out))
-	return np.unravel_multi_index(index,shape)
+
 
 # ravel_index
 def ravel_multi_index(index, shape):
