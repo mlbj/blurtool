@@ -7,8 +7,13 @@ import PIL
 import cv2
 import copy
 
+
 import torch.multiprocessing as mp
 mp.set_sharing_strategy('file_system')
+
+device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+# device= torch.device("cpu")
+# print(device)
 
 
 from timeit import default_timer as timer
@@ -16,7 +21,7 @@ from timeit import default_timer as timer
 import scipy
 import numpy as np
 pi = torch.tensor(math.pi)  # convert to tensor
-
+eps=1e-10
 
 
 '''
@@ -24,11 +29,12 @@ Blur class. This class Holds both stationary and nonstationary blur subclasses.
 '''
 class Blur(nn.Module):
 	def __init__(self):
-		
+		super().__init__()
 		
 		
 		# misc parameters 
 		self.forward_timer=-1
+		self.kernel_shape=None
 		
 	
 	# to-do: transform time measuring and batch handling into function decorators
@@ -80,24 +86,36 @@ class StationaryBlur(Blur):
 			kernel=Kernel(kernel.shape,psf_data=kernel)
 
 		self.kernel=kernel
+		self.shape=self.kernel.shape
 
 	def _forward(self,x,conjugate=False,n_pool=1,debug=False):
 		pad_width=[x.shape[1]-self.kernel.shape[0],x.shape[2]-self.kernel.shape[1]]
-		shifted_padded_kernel=cshift(pad(self.kernel(),pad_width))
+		padded_kernel=pad(self.kernel(),pad_width)
+
+		# # forward pad
+		# og_x_shape=(x.shape[1],x.shape[2]) # THIS WILL BREAK WHEN x.shape[0] != 1
+		# forward_pad_width=[x.shape[1],x.shape[2]]
+		# x=pad(x,forward_pad_width,mode='wrap')
+		# padded_kernel=cshift(pad(padded_kernel,forward_pad_width))
+
+		# shift the padded kernel
+		shifted_padded_kernel=cshift(padded_kernel)
 
 		fft_x = torch.fft.fftn(x)
 		if conjugate is False:
 			fft_shifted_padded_kernel = torch.fft.fftn(shifted_padded_kernel, s=x.shape[-2:])
 		else: 
+			# fft_shifted_padded_kernel = torch.conj(torch.fft.fftn(shifted_padded_kernel, s=x.shape[-2:]))
+			# fft_shifted_padded_kernel =  torch.fft.ifftn(shifted_padded_kernel,s=x.shape[-2:],norm='forward')
 			fft_shifted_padded_kernel = torch.conj(torch.fft.fftn(shifted_padded_kernel, s=x.shape[-2:]))
+
 		fft_product = fft_x*fft_shifted_padded_kernel
 		x_conv_kernel = torch.fft.ifftn(fft_product).real
+
+
 		return x_conv_kernel
 
-	# def forward_check(self,x):
-	# 	from numpy.fft import fft2,ifft2
-	# 	ret=ifft2(fft2(x.clone().detach().numpy())*fft2(cshift(self.kernel()).clone().detach().numpy(),s=x.shape)).real
-	# 	return torch.tensor(ret)
+		# return crop_around(x_conv_kernel,og_x_shape)
 
 
 '''
@@ -106,6 +124,7 @@ NonstationaryBlur class.
 class NonstationaryBlur(Blur):
 	def __init__(self,lattice,approx=True):
 		super().__init__()
+		# Super(Conv2dUnary, self).__init__()
 	
 		# this holds the module's parameters, which is necessary for proper initialization of the nn.Module object 
 		self._modules = {}
@@ -133,7 +152,7 @@ class NonstationaryBlur(Blur):
 	# since kernels are computed using eigenkernels normally when the lattice is decomposed, it would be fine to just 
 	# use the _forward_nondecomposed always. however, for decomposed lattices, _forward_decomposed is way faster.
 	def _forward_nondecomposed(self,x,conjugate=False,n_pool=1,debug=False):
-		y=torch.zeros(x.shape)
+		y=torch.zeros(x.shape).to(device)
 
 		# linear forward
 		if n_pool==1:
@@ -176,7 +195,7 @@ class NonstationaryBlur(Blur):
 					if debug is True:
 						print('finished row ',j)
 
-				y=torch.stack(yjs,dim=1)
+				y=torch.stack(yjs,dim=1).to(device)
 
 			# #compute everything in parallel at once using torch.multiprocessing.pool
 			# with mp.get_context("spawn").Pool(n_pool) as pool:
@@ -229,7 +248,7 @@ class NonstationaryBlur(Blur):
 
 	# decomposed forward method
 	def _forward_decomposed(self,x,conjugate=False,n_pool=1,debug=False):
-		y=torch.zeros(x.shape)
+		y=torch.zeros(x.shape).to(device)
 		pad_shape=(x.shape[1]-self.lattice.kernel_shape[0],x.shape[2]-self.lattice.kernel_shape[1])
 
 		for c in range(self.lattice.rank):
@@ -245,9 +264,9 @@ class NonstationaryBlur(Blur):
 
 			# define a stationary blur and operate
 			if conjugate is False:
-				y=y+coef*stat_blur.forward(x,conjugate=conjugate)
+				y=y+coef*stat_blur.forward(x,conjugate=False)
 			elif conjugate is True:
-				y=y+stat_blur.forward(coef*x,conjugate=conjugate)
+				y=y+stat_blur.forward(coef*x,conjugate=True)
 
 
 		return y
@@ -289,6 +308,8 @@ class Kernel:
 				return normalize_area(kernel)
 			elif normalize_mode=='minmax':
 				return normalize_minmax(kernel)
+			elif normalize_mode=='max':
+				return kernel/torch.max(kernel)
 	
 	# 2d rotated gaussian model 
 	def _gaussian(self):
@@ -299,6 +320,8 @@ class Kernel:
 		mx=self.psf_pars.get('mx',torch.tensor(0.0))
 		my=self.psf_pars.get('my',torch.tensor(0.0))
 		normalize=self.psf_pars.get('normalize',True)
+		normalize_mode=self.psf_pars.get('normalize_mode','area')
+		max_val=self.psf_pars.get('max_val',None)
 
 		# initialize gaussian kernel with zeros
 		gaussian_kernel=torch.zeros(self.shape).double()
@@ -316,11 +339,15 @@ class Kernel:
 		rotated_kernel=scipy.ndimage.rotate(gaussian_kernel.detach().clone().numpy(),angle,mode='nearest',reshape=False).transpose()
 		rotated_kernel=torch.tensor(rotated_kernel).double()
 
-		# each gaussian kernel is a density function, so we usually normalize its area to one.
+		#each gaussian kernel is a density function, so we usually normalize its area to one.
 		if normalize is True:
 			rotated_kernel=normalize_area(rotated_kernel)
 
-		return rotated_kernel 
+		# resolve max_val
+		if max_val is not None:
+			rotated_kernel=rotated_kernel/max_val
+
+		return rotated_kernel.to(device)
 
 	# TODO: test this
 	def _impulse(self):
@@ -409,7 +436,7 @@ class Lattice:
 		# define output variables
 		table_i=torch.zeros(sampled_shape[0]).int()
 		table_j=torch.zeros(sampled_shape[1]).int()
-		test_grid=torch.zeros(self.shape)
+		test_grid=torch.zeros(self.shape).to(device)
 
 		mod1=int(np.round((self.shape[0]-2*margin)/sampled_shape[0]))
 		mod2=int(np.round((self.shape[1]-2*margin)/sampled_shape[1]))
@@ -441,7 +468,7 @@ class Lattice:
 				test_blur=NonstationaryBlur(view_sampled_lat)
 
 			# blur test grid 
-			test_grid=test_blur.forward(test_grid,n_pool=8)	
+			test_grid=test_blur.forward(test_grid,n_pool=8)
 
 
 		if return_table is True:
@@ -555,6 +582,20 @@ class RotGaussian(Lattice):
 		
 		# half diagonal length normalization 
 		self.half_diag_length=np.sqrt(self.cent_i**2 + self.cent_j**2)
+
+		self._max_val_found=False
+		# self.max_val=self._find_max_val()
+		# self._max_val_found=True
+
+	# def _find_max_val(self):
+	# 	max_val=0
+
+	# 	for i in [(self.shape[0]//2)-1,(self.shape[0]//2),(self.shape[0]//2)+1]:
+	# 		for j in [(self.shape[1]//2)-1,(self.shape[1]//2),(self.shape[1]//2)+1]:
+	# 			val_ij=torch.max(self.kernel((i,j))()).item()
+	# 			if val_ij>max_val:
+	# 				max_val=val_ij
+	# 	return max_val
 		
 	def kernel(self,pos):
 		# calculate parameters and return a Kernel() object call directly.
@@ -579,7 +620,10 @@ class RotGaussian(Lattice):
 		sy=ay+by*(r**gamma_y)
 
 		# cast a Kernel object and return	
-		psf_pars={'sx':sx,'sy':sy,'angle':theta}
+		if self._max_val_found is not True:
+			psf_pars={'sx':sx,'sy':sy,'angle':theta}
+		else:
+			psf_pars={'sx':sx,'sy':sy,'angle':theta,'max_val':self.max_val}
 
 		return Kernel(self.kernel_shape,mode='gaussian',psf_pars=psf_pars)
 
@@ -659,7 +703,7 @@ class DecomposeLattice(Lattice):
 
 		eigenkernels=[]
 		for i in range(stacked_eigenkernels.shape[1]):
-			psf_data=stacked_eigenkernels[:,i].reshape(self.kernel_shape[0],self.kernel_shape[1])
+			psf_data=stacked_eigenkernels[:,i].reshape(self.kernel_shape[0],self.kernel_shape[1]).to(device)
 			eigenkernel=Kernel(self.kernel_shape,mode='from_data',psf_data=psf_data)
 			eigenkernels.append(eigenkernel)
 
@@ -669,7 +713,7 @@ class DecomposeLattice(Lattice):
 	# overload the kernel method to interpolated eigenkernel representation 
 	def kernel(self,pos):
 		pos=tuple(pos)
-		psf_data=torch.zeros(self.kernel_shape)#+self.mean_kernel
+		psf_data=torch.zeros(self.kernel_shape).to(device) #+self.mean_kernel
 		for c in range(self.rank):
 			psf_data=psf_data+self.eigencoefs[c][pos].item()*self.eigenkernels[c]()
 
@@ -678,7 +722,7 @@ class DecomposeLattice(Lattice):
 
 	def noninterpolated_kernel(self,pos):
 		pos=tuple(pos)
-		psf_data=torch.zeros(self.kernel_shape)#+self.mean_kernel
+		psf_data=torch.zeros(self.kernel_shape).to(device)
 		for c in range(self.rank):
 			psf_data=psf_data+self.noninterpolated_eigencoefs[c][pos].item()*self.eigenkernels[c]()
 
@@ -691,7 +735,7 @@ class DecomposeLattice(Lattice):
 
 		# unpack decompose_pars
 		rank=self.decompose_pars.get('r',input_lattice.shape[0]*input_lattice.shape[1])
-		normalize_input_psf=self.decompose_pars.get('normalize_input_psf',True)
+		normalize_input_psf=self.decompose_pars.get('normalize_input_psf',True) # THIS USED TO BE TRUE 
 
 		# mean bias is stored in the last element, so add one to rank
 		self.rank=rank
@@ -750,8 +794,8 @@ class DecomposeLattice(Lattice):
 			coef=torch.from_numpy(coef).double()
 
 			# fill 
-			coefs.append(coef.double())
-			noninterpolated_coefs.append(noninterpolated_coef)
+			coefs.append(coef.double().to(device))
+			noninterpolated_coefs.append(noninterpolated_coef.double().to(device))
 
 			# interpolation debug
 			# print('------------------------------------------')
@@ -879,13 +923,11 @@ class Deblur(nn.Module):
 		self.forward_timer=-1
 
 		# this holds the module's parameters, which is necessary for proper initialization of the nn.Module object 
-		self._modules = {}
-		
-		return 0
+		# self._modules = {}
 		
 	# y.shape: (batch_size,fig_shape[0],fig_shape[1])
 	# x.shape: (batch_size,fig_shape[0],fig_shape[1]) 
-	def forward(self,x,x_true=None,debug=True):
+	def forward(self,x,x_true=None,debug=True,normalize=True):
     	# start timer
 		start = timer()
     		
@@ -894,6 +936,10 @@ class Deblur(nn.Module):
 
 		# store original input shape
 		og_x_shape=x.shape	
+
+		# normalize input
+		if normalize is True:
+			x=normalize_minmax(x)
 
 		# add a batch dimension to the input, if necessary
 		if x.dim()==2:
@@ -918,36 +964,324 @@ class TVGDDeblur(Deblur):
 	def __init__(self,blur,deblur_pars):
 		super().__init__(blur,deblur_pars)
 
-		self.blur=blur
+	def _armijo(self,f, xk, pk, gfk, phi0, alpha0, rho=0.5, c1=1e-4):
+
+		gfkre=gfk.reshape(gfk.shape[0]*gfk.shape[1]*gfk.shape[2])
+		# print(gfk.shape)
+		pkre=pk.reshape(pk.shape[0]*pk.shape[1]*pk.shape[2])
+		# print(pk.shape)
+
+		derphi0 = gfkre.dot(pkre)
+		phi_a0 = f(xk + alpha0*pk)
+
+		while not phi_a0 <= phi0 + c1*alpha0*derphi0:
+			alpha0 = alpha0 * rho
+			phi_a0 = f(xk + alpha0*pk)
+    
+		return alpha0, phi_a0
 
 	def _forward(self,y,x_true=None,debug=True):
+
+		scores=[]
     	# unpack parameters
 		niter=self.deblur_pars.get('niter',100)
 		mu=self.deblur_pars.get('mu',torch.tensor(1e-3))
 		lamb=self.deblur_pars.get('lamb',torch.tensor(0.1))
 		x=self.deblur_pars.get('x0',y.clone().detach())
+		line_search=self.deblur_pars.get('line_search','armijo')
+
+		cost_fun=lambda xi: 0.5*torch.norm(y-self.blur.forward(xi))**2 + lamb*tv_norm(xi)[0]
+		grad_cost_fun=lambda xi: self.blur.forward(self.blur.forward(xi)-y,conjugate=True) + lamb*tv_norm(xi)[1]
+
+		# for ii in range(niter):
+		# 	for d in range(y.shape[0]):
+		# 		si_x = torch.from_numpy(scipy.ndimage.sobel(x[d,:,:].squeeze().cpu().clone().detach().numpy(),axis=0,mode='constant')).unsqueeze(0).to(device)
+		# 		sj_x = torch.from_numpy(scipy.ndimage.sobel(x[d,:,:].squeeze().cpu().clone().detach().numpy(),axis=1,mode='constant')).unsqueeze(0).to(device)
+		# 		sx=torch.hypot(si_x,sj_x)
+		# 		norm_sx=torch.norm(sx)
+		# 		si_fun= torch.from_numpy(scipy.ndimage.sobel((sx/norm_sx).cpu().clone().detach().numpy(),axis=0,mode='constant')).to(device)
+		# 		sj_fun= torch.from_numpy(scipy.ndimage.sobel((sx/norm_sx).cpu().clone().detach().numpy(),axis=1,mode='constant')).to(device)
+		# 		sfun=torch.hypot(si_fun,sj_fun)
+	                
+		# 		const=self.blur.forward(self.blur.forward(x[d,:,:])-y[d,:,:],conjugate=True) # this outter blur.forward has to be conjugated
+		# 		x[d,:,:]=x[d,:,:]-mu*(const+lamb*sfun) # x[d,:,:]=x[d,:,:]-mu*const-lamb*sfun
+
+		gfk=grad_cost_fun(x)
 
 		for ii in range(niter):
-			for d in range(y.shape[0]):
-				si_x = torch.from_numpy(scipy.ndimage.sobel(x[d,:,:].squeeze().clone().detach().numpy(),axis=0,mode='constant')).unsqueeze(0)
-				sj_x = torch.from_numpy(scipy.ndimage.sobel(x[d,:,:].squeeze().clone().detach().numpy(),axis=1,mode='constant')).unsqueeze(0)
-				sx=torch.hypot(si_x,sj_x)
-				norm_sx=torch.norm(sx)
-				si_fun= torch.from_numpy(scipy.ndimage.sobel((sx/norm_sx).clone().detach().numpy(),axis=0,mode='constant'))
-				sj_fun= torch.from_numpy(scipy.ndimage.sobel((sx/norm_sx).clone().detach().numpy(),axis=1,mode='constant'))
-				sfun=torch.hypot(si_fun,sj_fun)
+			norm,grad=tv_norm(x)
+			# diff=self.blur.forward(x)-y
+			# proj_diff=self.blur.forward(diff,conjugate=True)
+			# x=x-mu*(proj_diff+lamb*grad)]
+
+			grad_full=-gfk
 	                
-				const=self.blur.forward(self.blur.forward(x[d,:,:])-y[d,:,:],conjugate=True) # this outter blur.forward has to be conjugated
-				x[d,:,:]=x[d,:,:]-mu*const-lamb*sfun
-	                
-			if x_true is not None:
+			score=cost_fun(x)
+
+			if line_search=='armijo':
+				mu, new_score = self._armijo(cost_fun, x, grad_full, gfk, score, alpha0=mu)
+
+			# update
+			x=x+mu*grad_full
+
+			gfk=grad_cost_fun(x)
+			scores.append(score)
+
+			if x_true is not None and debug is True:
 				psnr_score=psnr(x_true,x).item()
-				print('iter: ',ii,'\t PSNR=',psnr_score)
-			else:
-				print('iter: ',ii)
-			 		
+				print('iter: ',ii,'\t mu=',mu,'\t PSNR=',psnr_score)
+
 		return x
 
+class l2CGDeblur(Deblur):
+	def __init__(self,blur,deblur_pars,denoiser):
+		super().__init__(blur,deblur_pars)
+		self.denoiser=denoiser
+
+	def _forward(self,y,x_true=None,debug=True):
+		scores=[]
+
+		# unpack parameters
+		# unpack parameters
+		niter=self.deblur_pars.get('niter',100)
+		mu=self.deblur_pars.get('mu',torch.tensor(1e-3))
+		lamb=self.deblur_pars.get('lamb',torch.tensor(0.1))
+		# gamma=self.deblur_pars.get('gamma',torch.tensor(1.0))
+		x=self.deblur_pars.get('x0',torch.zeros(y.shape).to(device)) # y.clone().detach().to(device)
+		tol=self.deblur_pars.get('tol',1e-8)
+
+		# norm,grad=tv_norm(x)
+		Hx=self.blur.forward(self.blur.forward(x),conjugate=True) +  lamb*x #lamb*(x-self.denoiser(x))
+		Aty=self.blur.forward(y,conjugate=True)
+		rj=Aty - Hx 
+		rjf=rj.flatten().clone()
+		rj_energy=rjf.dot(rjf)
+		if rj_energy<tol:
+			cg_niter=0
+		pj=rj.clone()
+		pjf=pj.flatten().clone()
+
+		for j in range(niter):
+			# norm,grad=tv_norm(pj)
+			Hpj=self.blur.forward(self.blur.forward(pj),conjugate=True) + lamb*pj #lamb*(pj-self.denoiser(pj))
+			Hpjf=Hpj.flatten()
+			aj=rj_energy/(pjf.dot(Hpjf))
+			x=x+aj*pj
+			rj=rj-aj*Hpj
+			rjf=rj.flatten().clone()
+			bj=rjf.dot(rjf)/rj_energy
+			rj_energy=rjf.dot(rjf)
+			# print('\t rj_energy=',rj_energy)
+			if rj_energy<tol:
+				print('finnished ',j,' iterations of cg')
+				break
+			pj=rj+bj*pj
+			pjf=pj.flatten()
+			print('sub iteration: ',j,'\t rj_energy=',rj_energy.item())
+
+
+			if x_true is not None and debug is True:
+				psnr_score=psnr(x_true,x).item()
+				# print('iter: ',ii,'\t PSNR=',psnr_score)
+				print('iter: ',j,'\t PSNR=',psnr_score)
+
+		return x
+
+
+class PnPADMMDeblur(Deblur):
+	def __init__(self,blur,deblur_pars,denoiser,mode='cg'):
+		super().__init__(blur,deblur_pars)
+
+		self.denoiser=denoiser
+		self.mode=mode
+
+	def _forward(self,y,x_true=None,debug=True):
+		scores=[]
+
+    	# unpack parameters
+		niter=self.deblur_pars.get('niter',100)
+		mu=self.deblur_pars.get('mu',torch.tensor(1e-3))
+		lamb=self.deblur_pars.get('lamb',torch.tensor(0.1))
+		gamma=self.deblur_pars.get('gamma',torch.tensor(1.0))
+		x=self.deblur_pars.get('x0',torch.zeros(y.shape).to(device)) # y.clone().detach().to(device)
+		# cg_niter=self.deblur_pars.get('cg_niter',5*x.shape[0]*x.shape[1])
+		cg_tol=self.deblur_pars.get('cg_tol',1e-8)
+
+
+		z=torch.zeros(y.shape).to(device)
+		m=torch.zeros(y.shape).to(device)
+
+		if self.mode=='cg':
+			Aty=self.blur.forward(y,conjugate=True)
+
+		for ii in range(niter):
+			# x update 
+			## r0 approx 
+			# x=(z-m)-(1/mu)*self.blur.forward(self.blur.forward(z-m)-y,conjugate=True)
+
+			## cg
+			if self.mode=='cg':
+				cg_niter=self.deblur_pars.get('cg_niter',x.shape[1]*x.shape[2])
+				Hx=self.blur.forward(self.blur.forward(x),conjugate=True)+mu*x
+				rj=Aty+mu*(z-m) - Hx
+				rjf=rj.flatten().clone()
+				rj_energy=rjf.dot(rjf)
+				if rj_energy<cg_tol:
+					cg_niter=0
+				pj=rj.clone()
+				pjf=pj.flatten().clone()
+				for j in range(cg_niter):
+					Hpj=self.blur.forward(self.blur.forward(pj),conjugate=True)+mu*pj
+					Hpjf=Hpj.flatten()
+					aj=rj_energy/(pjf.dot(Hpjf))
+					x=x+aj*pj
+					rj=rj-aj*Hpj
+					rjf=rj.flatten().clone()
+					bj=rjf.dot(rjf)/rj_energy
+					rj_energy=rjf.dot(rjf)
+					# print('\t rj_energy=',rj_energy)
+					if rj_energy<cg_tol:
+						print('finnished ',j,' iterations of cg')
+						break
+					pj=rj+bj*pj
+					pjf=pj.flatten()
+					print('sub iteration: ',j,'\t rj_energy=',rj_energy.item())
+
+
+			elif self.mode=='gd':
+				print('Not implemented yet')
+
+
+			# z update
+			z=self.denoiser(x+m)
+
+			# m update
+			m=m+(x-z)
+
+			# mu update
+			mu=mu*gamma
+
+			if x_true is not None and debug is True:
+				psnr_score=psnr(x_true,x).item()
+				# print('iter: ',ii,'\t PSNR=',psnr_score)
+				print('iter: ',ii,'\t PSNR=',psnr_score)
+
+		return x
+
+
+''' 
+common operators 
+'''
+
+
+# taken from https://gist.github.com/rwightman/f2d3849281624be7c0f11c85c87c1598
+# """ Median pool (usable as median filter when stride=1) module. """
+
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.nn.modules.utils import _pair, _quadruple
+
+class MedianPool2d(nn.Module):
+	def __init__(self, kernel_size=3, stride=1, padding=0, same=True):
+		super(MedianPool2d, self).__init__()
+		self.k = _pair(kernel_size)
+		self.stride = _pair(stride)
+		self.padding = _quadruple(padding)  # convert to l, r, t, b
+		self.same = same
+
+	def forward(self, x):
+		og_shape=x.shape
+
+		if x.dim()==2:
+			x=x.unsqueeze(0)
+			x=x.unsqueeze(0)
+		elif x.dim()==3:
+			x=x.unsqueeze(0)
+		elif x.dim()==4:
+			print(x.shape)
+
+
+		# using existing pytorch functions and tensor ops so that we get autograd, 
+		# would likely be more efficient to implement from scratch at C/Cuda level
+		x = F.pad(x, self._padding(x), mode='reflect')
+		x = x.unfold(2, self.k[0], self.stride[0]).unfold(3, self.k[1], self.stride[1])
+		x = x.contiguous().view(x.size()[:4] + (-1,)).median(dim=-1)[0]
+		return x.reshape(og_shape)
+
+	def _padding(self, x):
+		if self.same:
+			ih, iw = x.size()[2:]
+			if ih % self.stride[0] == 0:
+				ph = max(self.k[0] - self.stride[0], 0)
+			else:
+				ph = max(self.k[0] - (ih % self.stride[0]), 0)
+			if iw % self.stride[1] == 0:
+				pw = max(self.k[1] - self.stride[1], 0)
+			else:
+				pw = max(self.k[1] - (iw % self.stride[1]), 0)	
+			pl = pw // 2
+			pr = pw - pl
+			pt = ph // 2
+			pb = ph - pt
+			padding = (pl, pr, pt, pb)
+		else:
+			padding = self.padding
+		return padding
+	   
+
+import ffdnet
+
+def ffd(xi,sigma):
+    og_xi_shape=xi.shape
+    if xi.dim()==2:
+        xi=xi.unsqueeze(0)
+
+    # normalize input
+    ma=torch.max(xi).to(device)
+    mi=torch.min(xi).to(device)
+    if ma>mi:
+        dxi=((xi-mi)/(ma-mi+eps))
+    
+    #img_input=np.dstack((img,img,img))
+    img_input=xi.reshape(xi.shape[1],xi.shape[2],xi.shape[0])
+    denoised=ffdnet.run(img_input.cpu().clone().detach().numpy(),sigma)
+    denoised=torch.from_numpy(denoised).to(device)
+    denoised=denoised.reshape(xi.shape[0],xi.shape[1],xi.shape[2])
+    
+    # denormalize output
+    denoised=denoised*(ma-mi+eps)+mi
+    
+    return denoised.reshape(og_xi_shape)
+
+
+
+
+#  Computes the total variation norm and its gradient. 
+# source: https://gist.github.com/crowsonkb/ddf8167359be4ba2aa34835aa207e241 //// jcjohnson/cnn-vis.
+def tv_norm(x):
+	x_diff = x - torch.roll(x, -1, dims=1)
+	y_diff = x - torch.roll(x, -1, dims=2)
+
+	grad_norm2 = x_diff**2 + y_diff**2 + eps
+	norm = torch.sum(torch.sqrt(grad_norm2))
+	dgrad_norm = 0.5 / torch.sqrt(grad_norm2)
+	dx_diff = 2 * x_diff * dgrad_norm
+	dy_diff = 2 * y_diff * dgrad_norm
+	grad = dx_diff + dy_diff
+
+	grad[:,:, 1:] -= dx_diff[:,:, :-1]
+	grad[:,1:, :] -= dy_diff[:,:-1, :]
+	return norm, grad
+
+
+def tv_grad_approx(x,k,):
+	x_diff = x - torch.roll(x, -1, dims=1)
+	y_diff = x - torch.roll(x, -1, dims=2)
+
+
+
+	grad_norm2 = x_diff**2 + y_diff**2 + eps
+	norm = torch.sum(torch.sqrt(grad_norm2))
 
 ''' 
 misc functions
@@ -955,7 +1289,8 @@ misc functions
 
 # rectangular pad of specified width. output at dimension i is centered if pad_shape[i] is even.
 # TODO: directly used torch.pad instead of this
-def pad(x,pad_shape):
+# TODO: test wrap mode
+def pad(x,pad_shape,mode='zeros'):
 
 	# attemps to suppress batch dimension
 	x=x.squeeze()
@@ -969,7 +1304,14 @@ def pad(x,pad_shape):
 	batch_size,n1,n2=x.shape
 
 	px=torch.zeros(batch_size,n1+pn1,n2+pn2)
-	px[:,:n1,:n2]=x.clone().detach()
+
+	if mode=='zeros':
+		px[:,:n1,:n2]=x.clone().detach()
+	elif mode=='wrap':
+		px[:,:n1,:n2]=x.clone().detach()
+		px[:,n1:n1+pn1,n2:n2+pn2]=x[:,:pn1,:pn2].clone().detach()
+		px[:,n1:n1+pn1,:n2]=x[:,:pn1,:n2].clone().detach()
+		px[:,:n1,n2:n2+pn2]=x[:,:n1,:pn2].clone().detach()
 
 	# find new center
 	new_center=( (pn1+1)//2,(pn2+1)//2 )
@@ -1015,7 +1357,7 @@ def cshift(f, t=None):
 
 	g = h[:,r:r+n1, c:c+n2]
 
-	return g.reshape(og_f_shape)
+	return g.reshape(og_f_shape).to(device)
 
 
 # crops h around pos using a rectangular window of arbitrary shape
@@ -1052,7 +1394,7 @@ def crop_around(h,crop_shape,pos=None):
 	jpad=j+w2+1
 	cropped_h=h_pad[ipad-w1-add_begin_1:ipad+w1+add_end_1,jpad-w2-add_begin_2:jpad+w2+add_end_2]
 
-	return cropped_h
+	return cropped_h.to(device)
 
 
 # [min,max] normalization 
@@ -1139,7 +1481,7 @@ def psnr(original, compressed):
 # TODO: implement with torch
 def ssim(original,compressed):
 	from skimage.metrics import structural_similarity
-	score=structural_similarity(original.clone().detach().numpy(),compressed.clone().detach().numpy())
+	score=structural_similarity(original.cpu().clone().detach().numpy(),compressed.cpu().clone().detach().numpy())
 	return torch.tensor(score)
 
 # TODO: implement with torch
