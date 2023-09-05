@@ -122,7 +122,7 @@ class StationaryBlur(Blur):
 NonstationaryBlur class. 
 '''
 class NonstationaryBlur(Blur):
-	def __init__(self,lattice,approx=True):
+	def __init__(self,lattice):
 		super().__init__()
 		# Super(Conv2dUnary, self).__init__()
 	
@@ -140,17 +140,11 @@ class NonstationaryBlur(Blur):
 			self._forward=self._forward_decomposed
 		else:
 			self._forward=self._forward_nondecomposed
+			self._multi_forwardfun=self._multi_forwardfun_lsvc
 
-			# set forward nondecomposed method
-			self.approx=approx
-			if approx is True:
-				self._multi_forwardfun=self._multi_forwardfun_approx
-			else:
-				self._multi_forwardfun=self._multi_forwardfun_lsvc
-
-	# nonstationary blur can for forwarded in a different ways depending whether self.lattice is decomposed or not. 
-	# since kernels are computed using eigenkernels normally when the lattice is decomposed, it would be fine to just 
-	# use the _forward_nondecomposed always. however, for decomposed lattices, _forward_decomposed is way faster.
+	# nonstationary blur can be forwarded in different ways depending whether self.lattice is of decomposed type or not. 
+	# since kernels are usually computed using eigenkernels when the lattice is decomposed, it would be fine to just 
+	# use the _forward_nondecomposed always. however, for decomposed lattices, the _forward_decomposed method is way faster.
 	def _forward_nondecomposed(self,x,conjugate=False,n_pool=1,debug=False):
 		y=torch.zeros(x.shape).to(device)
 
@@ -206,8 +200,8 @@ class NonstationaryBlur(Blur):
 		return y
 
 
-	# function to be mapped into pool
-	def _multi_forwardfun_approx(self,args):
+	# function to be mapped into pool. This implements the original Linear Space-Variant (LSV) convolution approach in parallel
+	def _multi_forwardfun_lsvc(self,args):
 		# unpack parameters
 		i,j,k=args
 		pos=[j,k]
@@ -223,28 +217,28 @@ class NonstationaryBlur(Blur):
 
 		return yijk
 
-	# function to be mapped into pool. This implements the original Linear Space-Variant (LSV) convolution approach in parallel
-	def _multi_forwardfun_lsvc(self,args):
-		# unpack parameters
-		i,j,k=args
-		pos=[j,k]
+
+	# def _multi_forwardfun_lsvc(self,args):
+	# 	# unpack parameters
+	# 	i,j,k=args
+	# 	pos=[j,k]
 		
-		# define operands
-		x_window=crop_around(self._temp_x[i,:,:].squeeze(),self.lattice.kernel_shape,pos=pos)
-		w0,w1=self.lattice.kernel_shape[0]//2,self.lattice.kernel_shape[1]//2
+	# 	# define operands
+	# 	x_window=crop_around(self._temp_x[i,:,:].squeeze(),self.lattice.kernel_shape,pos=pos)
+	# 	w0,w1=self.lattice.kernel_shape[0]//2,self.lattice.kernel_shape[1]//2
 
 
-		yijk=0
-		for alpha in torch.arange(-w0,w0+self.lattice.kernel_shape[0]%2): # (-w0,w0+1): (odd)
-			for beta in torch.arange(-w1,w1+self.lattice.kernel_shape[0]%2): # (-w1,w1+1): (odd)
-				# define kernel of current position
-				kernel=self.lattice.kernel((j+alpha,k+beta))()
-				# apply convolution in spatial domain
-				fix_last_i=(self.lattice.kernel_shape[0]+1)%2
-				fix_last_j=(self.lattice.kernel_shape[1]+1)%2
-				yijk=yijk+x_window[w0+alpha,w1+beta]*(kernel[w0-alpha-fix_last_i,w1-beta-fix_last_j]) # -0,-0 (odd)
+	# 	yijk=0
+	# 	for alpha in torch.arange(-w0,w0+self.lattice.kernel_shape[0]%2): # (-w0,w0+1): (odd)
+	# 		for beta in torch.arange(-w1,w1+self.lattice.kernel_shape[0]%2): # (-w1,w1+1): (odd)
+	# 			# define kernel of current position
+	# 			kernel=self.lattice.kernel((j+alpha,k+beta))()
+	# 			# apply convolution in spatial domain
+	# 			fix_last_i=(self.lattice.kernel_shape[0]+1)%2
+	# 			fix_last_j=(self.lattice.kernel_shape[1]+1)%2
+	# 			yijk=yijk+x_window[w0+alpha,w1+beta]*(kernel[w0-alpha-fix_last_i,w1-beta-fix_last_j]) # -0,-0 (odd)
 
-		return yijk
+	# 	return yijk
 
 	# decomposed forward method
 	def _forward_decomposed(self,x,conjugate=False,n_pool=1,debug=False):
@@ -1034,9 +1028,8 @@ class TVGDDeblur(Deblur):
 		return x
 
 class l2CGDeblur(Deblur):
-	def __init__(self,blur,deblur_pars,denoiser):
+	def __init__(self,blur,deblur_pars):
 		super().__init__(blur,deblur_pars)
-		self.denoiser=denoiser
 
 	def _forward(self,y,x_true=None,debug=True):
 		scores=[]
