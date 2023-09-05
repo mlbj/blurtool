@@ -5,7 +5,7 @@ This script provides Python tools for blurring and deblurring images using both 
 
 ## Prerequisites
 
-The last version of the script was tested with the following requirements
+The latest version of the script was tested with the following requirements
 
 - Python 3.10.9+ 
 - torch==1.13.1
