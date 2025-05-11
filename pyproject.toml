@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=61.0.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "blurtool"
+version = "0.1"
+description = "Nonstationary blur operations with Pytorch"
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [
+    {name = "Mauro Brandão", email = "mrbrjr@gmail.com"}
+]
+license = {text = "MIT"}
+keywords = ["blur", "pytorch", "deblurring", "computational-photography"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "Programming Language :: Python :: 3.10",
+]
+
+dependencies = [
+    "torch==1.13.1",
+    "numpy==1.23.5",
+    "scikit-image==0.19.3",
+    "matplotlib==3.6.2",
+    "Pillow==9.4.0",
+    "opencv-python==4.5.5.64"
+]
+
+[tool.setuptools]
+packages = ["blurtool"]
+package-dir = {"" = "src"}  # Only if using src layout
+
+[project.urls]
+Homepage = "https://github.com/mlbj/blurtool"
