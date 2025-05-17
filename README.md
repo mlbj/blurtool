@@ -42,7 +42,7 @@ lat = blurtool.RotGaussian(
     lattice_pars={'ax':0.01, 'ay':0.01, 'bx':0.5, 'by':0.1, 'gamma_x':1, 'gamma_y':1})
 
 # Create a nonstationary blur from the lattice
-blur = blurtool.StationaryBlur(lat)
+blur = blurtool.NonstationaryBlur(lat)
 
 # Apply the nonstationary blur
 blurred_image = blur(image)
@@ -51,9 +51,9 @@ blurred_image = blur(image)
 ### 3. Nonstationary blur (Using eigen PSF model) 
 ```python
 # Since the original lattice from the previous example is too big and redundant, 
-# we can sample it in only (8,8) stationary kernels in a zero order regular fashion.
+# we can sample it in only (8,8) stationary kernels in zero order regular way using
+# the following
 sampled_lat = lat.sample(sampled_shape = (8,8))
-
 
 # Compute the eigen PSF lattice of the sampled Lattice.
 pca_lat = blurtool.DecomposeLattice(sampled_lat, 
