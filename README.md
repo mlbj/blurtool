@@ -1,6 +1,6 @@
 # blurtool 
 
-This package provides a quick way to perform nonstationary blur operations using PyTorch, including tools for creating, manipulating, and storing Point Spread Function (PSF) objects. It also includes an implementation of the Eigenkernels approach proposed by [Gwak & Yang (2020)](https://doi.org/10.1364/OE.405448) as well as a robust alternative as described in [Brandão-Junior (2023)](https://doi.org/10.14209/sbrt.2023.1570908350).
+This package provides a quick way to perform nonstationary blur operations using PyTorch, including tools for creating, manipulating, and storing Point Spread Function (PSF) objects. It also includes an implementation of the Eigenkernels approach proposed by [Gwak & Yang (2020)](https://doi.org/10.1364/OE.405448) as well as a robust alternative as described in [Brandão-Junior et al.(2023)](https://doi.org/10.14209/sbrt.2023.1570908350).
 
 | Original | Stationary Blur | Nonstationary Blur |
 |---------------------|---------------------------|-------------------------------|
