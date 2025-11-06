@@ -100,7 +100,7 @@ If you wish to cite this work, you can use the following `bibtex` entry
 ```bibtex
 @inproceedings{brandao2023nonstationary,
     title = {Nonstationary blur modeling using robust eigenkernels},
-    author = {Brandão-Junior, M. L.},
+    author = {Brandão-Junior, M. L. and Lima, Victor Carneiro and Lopes, Renato da Rocha},
     booktitle = {XLI Brazilian Symposium On Telecommunications and Signal Processing},
     year = {2023},
     publisher = {Brazilian Telecommunications Society},
