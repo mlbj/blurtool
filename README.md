@@ -51,7 +51,7 @@ blurred_image = blur(image)
 ### 3. Nonstationary blur (Using eigen PSF model) 
 ```python
 # Since the original lattice from the previous example is too big and redundant, 
-# we can sample it in only (8,8) stationary kernels in zero order regular way using
+# We can sample it in only (8,8) stationary kernels in zero order regular way using
 # the following
 sampled_lat = lat.sample(sampled_shape = (8,8))
 
@@ -70,7 +70,7 @@ blurred_image = blur(image)
 
 ## Installation
 
-For a clean setup, we recommend using a virtual environment. For instance, using micromamba 
+For a clean setup, I recommend using a virtual environment. For instance, using micromamba 
 
 ```bash
 micromamba create -n blurtool python=3.10
