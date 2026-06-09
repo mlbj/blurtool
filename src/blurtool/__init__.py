@@ -76,7 +76,7 @@ class StationaryBlur(Blur):
 
         # Kernel must be a Kernel object or a psf data stored in a torch tensor
         if torch.is_tensor(kernel) is True:
-            kernel=Kernel(kernel.shape, psf_data=kernel)
+            kernel = Kernel(kernel.shape, psf_data=kernel)
 
         self.kernel = kernel
         self.shape = self.kernel.shape
