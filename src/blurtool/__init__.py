@@ -4,6 +4,7 @@ import math
 import torch
 import torch.nn as nn
 import torch.fft
+import torch.nn.functional as F
 import PIL
 import cv2
 import copy
@@ -67,10 +68,10 @@ class Blur(nn.Module):
 Stationary class. 
 '''
 class StationaryBlur(Blur):
-    def __init__(self, kernel):
+    def __init__(self, kernel, mode='fft'):
         super().__init__()
 
-        # This holds the module's parameters, which is necessary for proper initialization of the nn.Module object 
+        # This holds the module's parameters, which is necessary for proper initialization of the nn.Module object
         self._modules = {}
 
         # Kernel must be a Kernel object or a psf data stored in a torch tensor
@@ -79,8 +80,14 @@ class StationaryBlur(Blur):
 
         self.kernel = kernel
         self.shape = self.kernel.shape
+        self.mode = mode
 
-    def _forward(self, x, conjugate=False, n_pool=1, debug=False):
+        if mode == 'fft':
+            self._forward = self._forward_fft
+        else:
+            self._forward = self._forward_spatial
+
+    def _forward_fft(self, x, conjugate=False, n_pool=1, debug=False):
         pad_width = [x.shape[1] - self.kernel.shape[0], x.shape[2] - self.kernel.shape[1]]
         padded_kernel = pad(self.kernel(), pad_width)
 
@@ -107,19 +114,34 @@ class StationaryBlur(Blur):
         return x_conv_kernel
         # return crop_around(x_conv_kernel, og_x_shape)
 
+    def _forward_spatial(self, x, conjugate=False, n_pool=1, debug=False):
+        kernel_data = self.kernel().double()
+        kH, kW = kernel_data.shape
+        C = x.shape[0]
+        x_4d = x.unsqueeze(0)  # (1, C, H, W)
+        # expand kernel to (C, 1, kH, kW) for grouped convolution (one kernel per channel)
+        weight = kernel_data.unsqueeze(0).unsqueeze(0).expand(C, 1, kH, kW)
+        # F.conv2d is cross-correlation (no flip); true forward convolution requires flipping,
+        # conjugate/adjoint does not (cross-correlation is already the adjoint of convolution)
+        if not conjugate:
+            weight = weight.flip([-2, -1])
+        y_4d = F.conv2d(x_4d, weight.contiguous(), padding=(kH // 2, kW // 2), groups=C)
+        return y_4d.squeeze(0)
+
 '''
-NonstationaryBlur class. 
+NonstationaryBlur class.
 '''
 class NonstationaryBlur(Blur):
-    def __init__(self, lattice):
+    def __init__(self, lattice, mode='fft'):
         super().__init__()
         # Super(Conv2dUnary, self).__init__()
 
-        # This holds the module's parameters, which is necessary for proper initialization of the nn.Module object 
+        # This holds the module's parameters, which is necessary for proper initialization of the nn.Module object
         self._modules = {}
 
         self.lattice = lattice
         self.shape = self.lattice.shape
+        self.mode = mode
 
         # Other attributes
         self._temp_x = None
@@ -153,7 +175,7 @@ class NonstationaryBlur(Blur):
                         x_window = crop_around(x[i, :, :].squeeze(), kernel.shape, pos=pos)
 
                         # define a stationary blur and operate
-                        stat_blur = StationaryBlur(kernel)
+                        stat_blur = StationaryBlur(kernel, mode=self.mode)
 
                         y[i, j, k] = stat_blur.forward(x_window)[kernel.shape[0]//2, kernel.shape[1]//2]
 
@@ -199,7 +221,7 @@ class NonstationaryBlur(Blur):
         x_window = crop_around(self._temp_x[i, :, :].squeeze(), kernel.shape, pos=pos)
 
         # define a stationary blur and operate
-        stat_blur = StationaryBlur(kernel)
+        stat_blur = StationaryBlur(kernel, mode=self.mode)
 
         yijk = stat_blur.forward(x_window)[kernel.shape[0]//2, kernel.shape[1]//2]
 
@@ -229,15 +251,22 @@ class NonstationaryBlur(Blur):
     # decomposed forward method
     def _forward_decomposed(self, x, conjugate=False, n_pool=1, debug=False):
         y = torch.zeros(x.shape).to(device)
-        pad_shape = (x.shape[1] - self.lattice.kernel_shape[0], x.shape[2] - self.lattice.kernel_shape[1])
+
+        if self.mode == 'fft':
+            pad_shape = (x.shape[1] - self.lattice.kernel_shape[0], x.shape[2] - self.lattice.kernel_shape[1])
 
         for c in range(self.lattice.rank):
-            # create a blur object using the current padded eigenkernel
             eigenkernel_data = self.lattice.eigenkernels[c]()
-            padded_eigenkernel_data = pad(eigenkernel_data, pad_shape)
 
-            padded_eigenkernel = Kernel(self.shape, psf_data=padded_eigenkernel_data, mode='from_data')
-            stat_blur = StationaryBlur(padded_eigenkernel)
+            if self.mode == 'fft':
+                # fft path: kernel must be padded to full image size before convolution
+                padded_eigenkernel_data = pad(eigenkernel_data, pad_shape)
+                eigenkernel = Kernel(self.shape, psf_data=padded_eigenkernel_data, mode='from_data')
+            else:
+                # spatial path: use kernel at its natural size; F.conv2d handles the rest
+                eigenkernel = Kernel(self.lattice.kernel_shape, psf_data=eigenkernel_data, mode='from_data')
+
+            stat_blur = StationaryBlur(eigenkernel, mode=self.mode)
 
             # representation coefficients
             coef = self.lattice.eigencoefs[c]
