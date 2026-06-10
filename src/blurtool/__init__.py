@@ -88,30 +88,21 @@ class StationaryBlur(Blur):
             self._forward = self._forward_spatial
 
     def _forward_fft(self, x, conjugate=False, n_pool=1, debug=False):
-        pad_width = [x.shape[1] - self.kernel.shape[0], x.shape[2] - self.kernel.shape[1]]
-        padded_kernel = pad(self.kernel(), pad_width)
+        kernel_data = self.kernel()
+        kH, kW = kernel_data.shape[-2], kernel_data.shape[-1]
+        H, W = x.shape[-2], x.shape[-1]
 
-        # # forward pad
-        # og_x_shape = (x.shape[1], x.shape[2]) # THIS WILL BREAK WHEN x.shape[0] != 1
-        # forward_pad_width = [x.shape[1], x.shape[2]]
-        # x = pad(x, forward_pad_width, mode='wrap')
-        # padded_kernel = cshift(pad(padded_kernel, forward_pad_width))
-
-        # shift the padded kernel
-        shifted_padded_kernel = cshift(padded_kernel)
+        # Pad kernel to image size and shift its centre to the origin for the FFT.
+        # F.pad and torch.roll are differentiable, so autograd works through this path.
+        k_padded = F.pad(kernel_data, (0, W - kW, 0, H - kH))
+        k_shifted = torch.roll(k_padded, shifts=(-(kH // 2), -(kW // 2)), dims=(-2, -1))
 
         fft_x = torch.fft.fftn(x)
-        if conjugate is False:
-            fft_shifted_padded_kernel = torch.fft.fftn(shifted_padded_kernel, s=x.shape[-2:])
-        else: 
-            # fft_shifted_padded_kernel = torch.conj(torch.fft.fftn(shifted_padded_kernel, s=x.shape[-2:]))
-            # fft_shifted_padded_kernel = torch.fft.ifftn(shifted_padded_kernel, s=x.shape[-2:], norm='forward')
-            fft_shifted_padded_kernel = torch.conj(torch.fft.fftn(shifted_padded_kernel, s=x.shape[-2:]))
+        fft_k = torch.fft.fftn(k_shifted, s=x.shape[-2:])
+        if conjugate:
+            fft_k = torch.conj(fft_k)
 
-        fft_product = fft_x*fft_shifted_padded_kernel
-        x_conv_kernel = torch.fft.ifftn(fft_product).real
-
-        return x_conv_kernel
+        return torch.fft.ifftn(fft_x * fft_k).real
         # return crop_around(x_conv_kernel, og_x_shape)
 
     def _forward_spatial(self, x, conjugate=False, n_pool=1, debug=False):
