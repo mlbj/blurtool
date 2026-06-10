@@ -123,7 +123,8 @@ class StationaryBlur(Blur):
         # conjugate/adjoint does not (cross-correlation is already the adjoint of convolution)
         if not conjugate:
             weight = weight.flip([-2, -1])
-        y_4d = F.conv2d(x_4d, weight.contiguous(), padding=(kH // 2, kW // 2), groups=C)
+        x_4d = F.pad(x_4d, (kW // 2, kW // 2, kH // 2, kH // 2), mode='circular')
+        y_4d = F.conv2d(x_4d, weight.contiguous(), padding=0, groups=C)
         return y_4d.squeeze(0)
 
 '''
