@@ -35,3 +35,6 @@ src/blurtool/__pycache__/
 
 # Helsinki dataset (not ours to redistribute; local copy only, never in git history)
 data/
+
+# regenerable script outputs
+results/
