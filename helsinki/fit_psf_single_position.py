@@ -51,18 +51,27 @@ def _gaussian_window(window_size, sigma, dtype, device):
 
 
 def ssim_map(pred, target, window, data_range=1.0):
-    """pred, target: (N, 1, H, W). Returns the per-pixel SSIM map."""
+    """pred, target: (N, 1, H, W). Returns the per-pixel SSIM map.
+
+    Uses reflect padding (not zero padding) around each patch before the local
+    windowed statistics: zero-padding would tell every patch border "there is
+    nothing outside you", which is false and, since it applies identically to
+    every pooled patch regardless of content, is a systematic bias rather than
+    noise that averages out.
+    """
     c1 = (0.01 * data_range) ** 2
     c2 = (0.03 * data_range) ** 2
     pad = window.shape[-1] // 2
 
-    mu_p = F.conv2d(pred, window, padding=pad)
-    mu_t = F.conv2d(target, window, padding=pad)
+    def local_mean(x):
+        return F.conv2d(F.pad(x, (pad, pad, pad, pad), mode="reflect"), window)
+
+    mu_p, mu_t = local_mean(pred), local_mean(target)
     mu_p2, mu_t2, mu_pt = mu_p * mu_p, mu_t * mu_t, mu_p * mu_t
 
-    sigma_p2 = F.conv2d(pred * pred, window, padding=pad) - mu_p2
-    sigma_t2 = F.conv2d(target * target, window, padding=pad) - mu_t2
-    sigma_pt = F.conv2d(pred * target, window, padding=pad) - mu_pt
+    sigma_p2 = local_mean(pred * pred) - mu_p2
+    sigma_t2 = local_mean(target * target) - mu_t2
+    sigma_pt = local_mean(pred * target) - mu_pt
 
     numerator = (2 * mu_pt + c1) * (2 * sigma_pt + c2)
     denominator = (mu_p2 + mu_t2 + c1) * (sigma_p2 + sigma_t2 + c2)
@@ -76,9 +85,25 @@ def kernel_smoothness(h):
     return (dh**2).sum() + (dw**2).sum()
 
 
-def make_kernel(raw):
-    """Non-negative, sum-to-one kernel from an unconstrained parameter."""
+def hann_taper(kernel_size, dtype, device):
+    """2D Hann window: 1 at the center, exactly 0 at the border.
+
+    Multiplied onto the kernel before normalization so PSF mass is
+    architecturally forced to decay to zero at its own support edge --
+    a real PSF does this; an unconstrained free-form array has no reason
+    to, and can otherwise park spurious weight at boundary pixels (see
+    the "weird border values" discussion this was added for).
+    """
+    n = torch.arange(kernel_size, dtype=dtype, device=device)
+    w1d = 0.5 * (1 - torch.cos(2 * torch.pi * n / (kernel_size - 1)))
+    return w1d.unsqueeze(1) * w1d.unsqueeze(0)
+
+
+def make_kernel(raw, taper=None):
+    """Non-negative, sum-to-one kernel from an unconstrained parameter, optionally tapered."""
     k = F.softplus(raw)
+    if taper is not None:
+        k = k * taper
     return k / k.sum()
 
 
@@ -136,6 +161,7 @@ def parse_args():
     p.add_argument("--lr", type=float, default=0.05)
     p.add_argument("--ssim-weight", type=float, default=1.0)
     p.add_argument("--smooth-weight", type=float, default=1e-3)
+    p.add_argument("--no-taper", action="store_true", help="Disable the Hann taper that forces PSF mass to zero at the kernel border")
     p.add_argument("--test-natural", type=str, default="Image_squirrel_200")
     p.add_argument("--test-text", type=str, default="timesR_size_30_sample_0001")
     p.add_argument("--seed", type=int, default=0)
@@ -185,10 +211,11 @@ def main():
     with torch.no_grad():
         raw.add_(0.01 * torch.randn_like(raw))
     optimizer = torch.optim.Adam([raw], lr=args.lr)
+    taper = None if args.no_taper else hann_taper(args.kernel_size, dtype=raw.dtype, device=device)
 
     for step in range(args.steps):
         optimizer.zero_grad()
-        kernel = make_kernel(raw)
+        kernel = make_kernel(raw, taper)
         pred = valid_conv(train_sharp, kernel)
         target = train_blurred.unsqueeze(1)
 
@@ -203,7 +230,7 @@ def main():
             print(f"step {step:4d}  loss={loss.item():.5f}  l2={l2.item():.5f}  "
                   f"ssim={1 - ssim_term.item():.4f}  smooth={smooth.item():.4f}")
 
-    kernel = make_kernel(raw).detach()
+    kernel = make_kernel(raw, taper).detach()
 
     train_metrics = evaluate(train_sharp, train_blurred, kernel, window, pad)
     print(f"\n[train, pooled] l2={train_metrics['l2']:.5f} (baseline {train_metrics['baseline_l2']:.5f})  "
