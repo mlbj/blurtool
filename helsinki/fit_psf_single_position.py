@@ -3,16 +3,23 @@ Fit a single small PSF for one fixed sensor position on the Helsinki defocus
 dataset, from real (sharp, blurred) camera pairs -- no deconvolution, this is
 a pure forward-model fit: find h such that conv(sharp, h) approx blurred.
 
-Two PSF parametrizations are available via --model:
+Three PSF parametrizations are available via --model:
     gaussian (default) -- an anisotropic Gaussian with a free centroid offset
         (sigma_x, sigma_y, theta, dy, dx -- 5 parameters). Smooth and compact
         by construction, so it cannot produce noise-driven pixel artifacts;
         this was the reliable choice in earlier work on this exact dataset at
         this exact blur scale.
+    zernike -- an actual diffraction model: PSF = |FFT(aperture * exp(i*W))|^2
+        with W a low-order Zernike wavefront expansion (defocus, astigmatism,
+        coma, spherical aberration -- 8 parameters). Inherently non-negative
+        and smooth, and can represent asymmetric shapes a Gaussian cannot.
+        Recycled from earlier work on this dataset, where it traded a little
+        training-set fit for better held-out generalization than a free-form
+        kernel -- the low-parameter-count story again, from a different angle.
     freeform -- an unconstrained per-pixel array (softplus + sum-to-one +
         Hann taper). More expressive, but with real sensor noise and finite
         data it can park spurious weight at individual pixels. Kept for
-        comparison against the gaussian model, not as the default.
+        comparison, not as the default.
 
 Objective (per patch, averaged over a large pooled batch of patches from
 every training scene at once):
@@ -187,10 +194,86 @@ class GaussianPSF(nn.Module):
         }
 
 
+class ZernikePSF(nn.Module):
+    """Fourier-optics pupil-function PSF: PSF = |FFT(aperture * exp(i*W))|^2, W a
+    low-order Zernike-like wavefront expansion (defocus, astigmatism, coma,
+    spherical aberration). 8 free parameters total.
+
+    Unlike GaussianPSF (an empirical shape) or FreeformPSF (per-pixel), this is
+    an actual diffraction model -- inherently non-negative and smooth, no
+    regularizer needed, and it can represent asymmetric/non-Gaussian PSF shapes
+    (coma, astigmatism) that a Gaussian cannot. Recycled from earlier work on
+    this dataset (`patch_psf_zernike_wavefront_model.ipynb`): it traded a bit
+    of training-set fit for *better* held-out generalization than a free-form
+    kernel there -- the low-parameter-count story again, from a different angle.
+
+    The pupil-plane PSF is computed on an `n_pupil`-sized grid, then resampled
+    to `kernel_size` via a learnable, differentiable zoom (affine_grid +
+    grid_sample) -- this absorbs the (uncalibrated) relationship between pupil
+    sampling and pixel scale, since we don't have the physical optics
+    parameters to derive it directly.
+    """
+
+    def __init__(self, kernel_size, n_pupil=48, device=None, dtype=torch.float32):
+        super().__init__()
+        self.kernel_size = kernel_size
+        self.n_pupil = n_pupil
+        coords = torch.linspace(-1, 1, n_pupil, device=device, dtype=dtype)
+        yy, xx = torch.meshgrid(coords, coords, indexing="ij")
+        self.yy, self.xx = yy, xx
+        self.rr2 = yy**2 + xx**2
+
+        init = torch.tensor([0.0, 8.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], device=device, dtype=dtype)
+        names = ["log_r_ap", "c_defocus", "c_astig1", "c_astig2", "c_coma1", "c_coma2", "c_spherical", "log_scale"]
+        self.names = names
+        for name, value in zip(names, init):
+            setattr(self, name, nn.Parameter(value.clone()))
+
+    def forward(self):
+        r_ap = torch.sigmoid(self.log_r_ap) * 0.9 + 0.1
+        aperture = torch.sigmoid((r_ap - torch.sqrt(self.rr2 + 1e-12)) * 30.0)  # soft, differentiable edge
+
+        yy, xx, rr2 = self.yy, self.xx, self.rr2
+        wavefront = (
+            self.c_defocus * rr2
+            + self.c_astig1 * (xx**2 - yy**2) + self.c_astig2 * (2 * xx * yy)
+            + self.c_coma1 * xx * rr2 + self.c_coma2 * yy * rr2
+            + self.c_spherical * rr2**2
+        )
+
+        pupil = torch.complex(aperture * torch.cos(wavefront), aperture * torch.sin(wavefront))
+        psf_full = torch.fft.fftshift(torch.fft.fft2(pupil))
+        psf_full = psf_full.real**2 + psf_full.imag**2  # intensity PSF, |.|^2
+
+        # differentiable zoom via affine_grid + grid_sample (continuous scale, real gradients)
+        zoom = torch.sigmoid(self.log_scale) * 0.9 + 0.1
+        theta = torch.zeros(1, 2, 3, device=psf_full.device, dtype=psf_full.dtype)
+        theta[0, 0, 0] = zoom
+        theta[0, 1, 1] = zoom
+        grid = F.affine_grid(theta, [1, 1, self.kernel_size, self.kernel_size], align_corners=True)
+        resized = F.grid_sample(
+            psf_full.unsqueeze(0).unsqueeze(0), grid, mode="bilinear", align_corners=True
+        ).squeeze()
+        resized = resized.clamp(min=0)
+        return resized / (resized.sum() + 1e-12)
+
+    def regularizer(self, kernel):
+        return torch.zeros((), device=kernel.device, dtype=kernel.dtype)
+
+    def describe(self):
+        with torch.no_grad():
+            out = {"r_ap": (torch.sigmoid(self.log_r_ap) * 0.9 + 0.1).item(),
+                   "zoom": (torch.sigmoid(self.log_scale) * 0.9 + 0.1).item()}
+            out.update({name: getattr(self, name).item() for name in self.names if name not in ("log_r_ap", "log_scale")})
+        return out
+
+
 def make_psf_model(args, device, seed=None):
     dtype = torch.float32
     if args.model == "gaussian":
         return GaussianPSF(args.kernel_size, init_sigma=args.init_sigma, device=device, dtype=dtype)
+    if args.model == "zernike":
+        return ZernikePSF(args.kernel_size, n_pupil=args.n_pupil, device=device, dtype=dtype)
     return FreeformPSF(
         args.kernel_size,
         taper=not args.no_taper,
@@ -274,8 +357,9 @@ def parse_args():
     p.add_argument("--data-root", type=str, default=None, help="Folder containing CAM01_focused/CAM02_blurred")
     p.add_argument("--focus-step", type=int, default=1, help="Blur level (0-4); 'level 1 blur' = 1")
     p.add_argument("--position", type=str, default="730,1180", help="cy,cx in full-frame pixel coordinates")
-    p.add_argument("--model", type=str, choices=["gaussian", "freeform"], default="gaussian")
+    p.add_argument("--model", type=str, choices=["gaussian", "freeform", "zernike"], default="gaussian")
     p.add_argument("--init-sigma", type=float, default=2.0, help="gaussian model: initial sigma_x=sigma_y")
+    p.add_argument("--n-pupil", type=int, default=48, help="zernike model: pupil-plane grid resolution")
     p.add_argument("--kernel-size", type=int, default=15)
     p.add_argument("--patch", type=int, default=48, help="Patch size compared in the loss")
     p.add_argument("--neighborhood", type=int, default=96, help="Side of the square tiling window around --position")
