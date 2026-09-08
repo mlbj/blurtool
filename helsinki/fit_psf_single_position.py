@@ -3,25 +3,41 @@ Fit a single small PSF for one fixed sensor position on the Helsinki defocus
 dataset, from real (sharp, blurred) camera pairs -- no deconvolution, this is
 a pure forward-model fit: find h such that conv(sharp, h) approx blurred.
 
+Two PSF parametrizations are available via --model:
+    gaussian (default) -- an anisotropic Gaussian with a free centroid offset
+        (sigma_x, sigma_y, theta, dy, dx -- 5 parameters). Smooth and compact
+        by construction, so it cannot produce noise-driven pixel artifacts;
+        this was the reliable choice in earlier work on this exact dataset at
+        this exact blur scale.
+    freeform -- an unconstrained per-pixel array (softplus + sum-to-one +
+        Hann taper). More expressive, but with real sensor noise and finite
+        data it can park spurious weight at individual pixels. Kept for
+        comparison against the gaussian model, not as the default.
+
 Objective (per patch, averaged over a large pooled batch of patches from
 every training scene at once):
     loss = 0.5 * mean((conv(sharp, h) - blurred)^2)      [pixel fidelity]
          + ssim_weight * (1 - SSIM(conv(sharp, h), blurred))  [structural fidelity]
-         + smooth_weight * TV(h)                          [mild stabilizer]
+         + regularizer(h)     [freeform only: a mild smoothness penalty]
 
 Why pooling everything into one batch works with so few source images: see
-the module docstring in `helsinki/data.py` and the project notes -- briefly,
-one shared kernel constrained by thousands of patches (dense tiles across
-many scenes) is a heavily overdetermined problem, whereas fitting a kernel
-to any single patch alone is not.
+the module docstring in `helsinki/data.py` -- one shared kernel constrained
+by thousands of patches (dense tiles across many scenes) is a heavily
+overdetermined problem, whereas fitting a kernel to any single patch alone
+is not. Real sensor noise on the blurred images is additive and (mostly)
+independent across patches, so it adds variance to the estimate but -- given
+a low-dimensional model and/or enough pooled patches -- should not bias it
+toward a specific spurious kernel shape; see --stability-check.
 
 Usage:
     python -m helsinki.fit_psf_single_position
-    python -m helsinki.fit_psf_single_position --steps 800 --kernel-size 15
+    python -m helsinki.fit_psf_single_position --model freeform --steps 800
+    python -m helsinki.fit_psf_single_position --stability-check
 """
 
 import argparse
 import json
+import math
 from pathlib import Path
 
 import matplotlib
@@ -30,6 +46,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 
 from helsinki.data import discover_scenes, extract_patch_pairs, find_data_root, load_pair
@@ -78,6 +95,16 @@ def ssim_map(pred, target, window, data_range=1.0):
     return numerator / denominator
 
 
+# ---------------------------------------------------------------------------
+# PSF parametrizations
+# ---------------------------------------------------------------------------
+def hann_taper(kernel_size, dtype, device):
+    """2D Hann window: 1 at the center, exactly 0 at the border."""
+    n = torch.arange(kernel_size, dtype=dtype, device=device)
+    w1d = 0.5 * (1 - torch.cos(2 * torch.pi * n / (kernel_size - 1)))
+    return w1d.unsqueeze(1) * w1d.unsqueeze(0)
+
+
 def kernel_smoothness(h):
     """Sum of squared finite differences -- a mild total-variation-style penalty."""
     dh = h[1:, :] - h[:-1, :]
@@ -85,26 +112,93 @@ def kernel_smoothness(h):
     return (dh**2).sum() + (dw**2).sum()
 
 
-def hann_taper(kernel_size, dtype, device):
-    """2D Hann window: 1 at the center, exactly 0 at the border.
+class FreeformPSF(nn.Module):
+    """Unconstrained per-pixel kernel: softplus (non-negative) * Hann taper, sum-to-one.
 
-    Multiplied onto the kernel before normalization so PSF mass is
-    architecturally forced to decay to zero at its own support edge --
-    a real PSF does this; an unconstrained free-form array has no reason
-    to, and can otherwise park spurious weight at boundary pixels (see
-    the "weird border values" discussion this was added for).
+    Expressive, but with only a few thousand noisy real patches it can fit
+    spurious structure at individual pixels -- see the module docstring.
     """
-    n = torch.arange(kernel_size, dtype=dtype, device=device)
-    w1d = 0.5 * (1 - torch.cos(2 * torch.pi * n / (kernel_size - 1)))
-    return w1d.unsqueeze(1) * w1d.unsqueeze(0)
+
+    def __init__(self, kernel_size, taper=True, smooth_weight=1e-3, seed=0, device=None, dtype=torch.float32):
+        super().__init__()
+        gen = torch.Generator().manual_seed(seed)
+        init = 0.01 * torch.randn(kernel_size, kernel_size, generator=gen)
+        self.raw = nn.Parameter(init.to(device=device, dtype=dtype))
+        self.taper = hann_taper(kernel_size, dtype, device) if taper else None
+        self.smooth_weight = smooth_weight
+
+    def forward(self):
+        k = F.softplus(self.raw)
+        if self.taper is not None:
+            k = k * self.taper
+        return k / k.sum()
+
+    def regularizer(self, kernel):
+        return self.smooth_weight * kernel_smoothness(kernel)
+
+    def describe(self):
+        return {}
 
 
-def make_kernel(raw, taper=None):
-    """Non-negative, sum-to-one kernel from an unconstrained parameter, optionally tapered."""
-    k = F.softplus(raw)
-    if taper is not None:
-        k = k * taper
-    return k / k.sum()
+class GaussianPSF(nn.Module):
+    """Anisotropic Gaussian with a free centroid offset: sigma_x, sigma_y, theta, dy, dx.
+
+    Smooth and compact by construction -- cannot produce a noise-driven pixel
+    artifact, since it has no per-pixel degrees of freedom at all. This was
+    the reliable PSF family in earlier work on this dataset at this blur scale.
+    """
+
+    def __init__(self, kernel_size, init_sigma=2.0, device=None, dtype=torch.float32):
+        super().__init__()
+        self.kernel_size = kernel_size
+        init_raw_sigma = math.log(math.exp(init_sigma) - 1.0)  # softplus^{-1}
+        self.raw_sigma_x = nn.Parameter(torch.tensor(init_raw_sigma, device=device, dtype=dtype))
+        self.raw_sigma_y = nn.Parameter(torch.tensor(init_raw_sigma, device=device, dtype=dtype))
+        self.theta = nn.Parameter(torch.zeros((), device=device, dtype=dtype))
+        self.dy = nn.Parameter(torch.zeros((), device=device, dtype=dtype))
+        self.dx = nn.Parameter(torch.zeros((), device=device, dtype=dtype))
+
+    def _sigmas(self):
+        return F.softplus(self.raw_sigma_x) + 0.3, F.softplus(self.raw_sigma_y) + 0.3
+
+    def forward(self):
+        sigma_x, sigma_y = self._sigmas()
+        coords = torch.arange(self.kernel_size, dtype=self.theta.dtype, device=self.theta.device)
+        coords = coords - (self.kernel_size - 1) / 2.0
+        yy, xx = torch.meshgrid(coords, coords, indexing="ij")
+        yy, xx = yy - self.dy, xx - self.dx
+        cos_t, sin_t = torch.cos(self.theta), torch.sin(self.theta)
+        u = cos_t * yy + sin_t * xx
+        v = -sin_t * yy + cos_t * xx
+        g = torch.exp(-0.5 * ((u / sigma_x) ** 2 + (v / sigma_y) ** 2))
+        return g / g.sum()
+
+    def regularizer(self, kernel):
+        return torch.zeros((), device=kernel.device, dtype=kernel.dtype)
+
+    def describe(self):
+        sigma_x, sigma_y = self._sigmas()
+        return {
+            "sigma_x": sigma_x.item(),
+            "sigma_y": sigma_y.item(),
+            "theta_deg": math.degrees(self.theta.item()),
+            "dy": self.dy.item(),
+            "dx": self.dx.item(),
+        }
+
+
+def make_psf_model(args, device, seed=None):
+    dtype = torch.float32
+    if args.model == "gaussian":
+        return GaussianPSF(args.kernel_size, init_sigma=args.init_sigma, device=device, dtype=dtype)
+    return FreeformPSF(
+        args.kernel_size,
+        taper=not args.no_taper,
+        smooth_weight=args.smooth_weight,
+        seed=args.seed if seed is None else seed,
+        device=device,
+        dtype=dtype,
+    )
 
 
 def valid_conv(sharp_batch, kernel):
@@ -114,6 +208,34 @@ def valid_conv(sharp_batch, kernel):
     return F.conv2d(x, w)
 
 
+def fit_psf(model, sharp_batch, blurred_batch, window, args, log_prefix=""):
+    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
+    target = blurred_batch.unsqueeze(1)
+    for step in range(args.steps):
+        optimizer.zero_grad()
+        kernel = model()
+        pred = valid_conv(sharp_batch, kernel)
+        l2 = 0.5 * F.mse_loss(pred, target)
+        ssim_term = 1.0 - ssim_map(pred, target, window).mean()
+        loss = l2 + args.ssim_weight * ssim_term + model.regularizer(kernel)
+        loss.backward()
+        optimizer.step()
+
+        if step % max(1, args.steps // 10) == 0 or step == args.steps - 1:
+            print(f"{log_prefix}step {step:4d}  loss={loss.item():.5f}  l2={l2.item():.5f}  "
+                  f"ssim={1 - ssim_term.item():.4f}")
+    return model().detach()
+
+
+def kernel_correlation(a, b):
+    a = a.flatten() - a.mean()
+    b = b.flatten() - b.mean()
+    return ((a * b).sum() / (a.norm() * b.norm() + 1e-12)).item()
+
+
+# ---------------------------------------------------------------------------
+# Data pooling / evaluation
+# ---------------------------------------------------------------------------
 def gather_patches(data_root, step, scene_ids, center, neighborhood, patch, kernel_size, stride, min_var):
     sharp_crops, blurred_crops = [], []
     for scene_id in scene_ids:
@@ -152,6 +274,8 @@ def parse_args():
     p.add_argument("--data-root", type=str, default=None, help="Folder containing CAM01_focused/CAM02_blurred")
     p.add_argument("--focus-step", type=int, default=1, help="Blur level (0-4); 'level 1 blur' = 1")
     p.add_argument("--position", type=str, default="730,1180", help="cy,cx in full-frame pixel coordinates")
+    p.add_argument("--model", type=str, choices=["gaussian", "freeform"], default="gaussian")
+    p.add_argument("--init-sigma", type=float, default=2.0, help="gaussian model: initial sigma_x=sigma_y")
     p.add_argument("--kernel-size", type=int, default=15)
     p.add_argument("--patch", type=int, default=48, help="Patch size compared in the loss")
     p.add_argument("--neighborhood", type=int, default=96, help="Side of the square tiling window around --position")
@@ -160,8 +284,11 @@ def parse_args():
     p.add_argument("--steps", type=int, default=500)
     p.add_argument("--lr", type=float, default=0.05)
     p.add_argument("--ssim-weight", type=float, default=1.0)
-    p.add_argument("--smooth-weight", type=float, default=1e-3)
-    p.add_argument("--no-taper", action="store_true", help="Disable the Hann taper that forces PSF mass to zero at the kernel border")
+    p.add_argument("--smooth-weight", type=float, default=1e-3, help="freeform model only")
+    p.add_argument("--no-taper", action="store_true", help="freeform model only: disable the Hann border taper")
+    p.add_argument("--stability-check", action="store_true",
+                    help="Also fit independently on two random disjoint halves of the training scenes "
+                         "and report kernel correlation, to check sensitivity to sensor noise vs. real signal")
     p.add_argument("--test-natural", type=str, default="Image_squirrel_200")
     p.add_argument("--test-text", type=str, default="timesR_size_30_sample_0001")
     p.add_argument("--seed", type=int, default=0)
@@ -191,6 +318,7 @@ def main():
         + scenes["qr"]
     )
     print(f"train scenes: {len(train_scenes)}  |  held out: {args.test_natural!r}, {args.test_text!r}")
+    print(f"psf model: {args.model}")
 
     common = dict(
         center=(cy, cx),
@@ -207,30 +335,31 @@ def main():
     window = _gaussian_window(11, 1.5, dtype=train_sharp.dtype, device=device)
     pad = args.kernel_size // 2
 
-    raw = torch.zeros(args.kernel_size, args.kernel_size, device=device, requires_grad=True)
-    with torch.no_grad():
-        raw.add_(0.01 * torch.randn_like(raw))
-    optimizer = torch.optim.Adam([raw], lr=args.lr)
-    taper = None if args.no_taper else hann_taper(args.kernel_size, dtype=raw.dtype, device=device)
+    stability = None
+    if args.stability_check:
+        print("\n--- stability check: fitting independently on two random disjoint scene halves ---")
+        rng = np.random.RandomState(args.seed)
+        shuffled = list(train_scenes)
+        rng.shuffle(shuffled)
+        half_a, half_b = shuffled[: len(shuffled) // 2], shuffled[len(shuffled) // 2 :]
+        kernels = []
+        for label, half in [("A", half_a), ("B", half_b)]:
+            sharp_h, blurred_h = gather_patches(data_root, args.focus_step, half, min_var=args.min_var, **common)
+            sharp_h, blurred_h = sharp_h.to(device), blurred_h.to(device)
+            model_h = make_psf_model(args, device, seed=args.seed)
+            kernel_h = fit_psf(model_h, sharp_h, blurred_h, window, args, log_prefix=f"  [half {label}] ")
+            kernels.append(kernel_h)
+            print(f"  [half {label}] {len(half)} scenes, {sharp_h.shape[0]} patches"
+                  + (f"  params={model_h.describe()}" if model_h.describe() else ""))
+        corr = kernel_correlation(kernels[0], kernels[1])
+        print(f"--- stability check: correlation(half A, half B) = {corr:.4f} "
+              f"(near 1.0 = stable/systematic signal; low/unstable = likely fitting noise) ---\n")
+        stability = {"correlation_half_a_half_b": corr}
 
-    for step in range(args.steps):
-        optimizer.zero_grad()
-        kernel = make_kernel(raw, taper)
-        pred = valid_conv(train_sharp, kernel)
-        target = train_blurred.unsqueeze(1)
-
-        l2 = 0.5 * F.mse_loss(pred, target)
-        ssim_term = 1.0 - ssim_map(pred, target, window).mean()
-        smooth = kernel_smoothness(kernel)
-        loss = l2 + args.ssim_weight * ssim_term + args.smooth_weight * smooth
-        loss.backward()
-        optimizer.step()
-
-        if step % max(1, args.steps // 10) == 0 or step == args.steps - 1:
-            print(f"step {step:4d}  loss={loss.item():.5f}  l2={l2.item():.5f}  "
-                  f"ssim={1 - ssim_term.item():.4f}  smooth={smooth.item():.4f}")
-
-    kernel = make_kernel(raw, taper).detach()
+    model = make_psf_model(args, device)
+    kernel = fit_psf(model, train_sharp, train_blurred, window, args)
+    if model.describe():
+        print(f"fitted params: {model.describe()}")
 
     train_metrics = evaluate(train_sharp, train_blurred, kernel, window, pad)
     print(f"\n[train, pooled] l2={train_metrics['l2']:.5f} (baseline {train_metrics['baseline_l2']:.5f})  "
@@ -263,13 +392,15 @@ def main():
         "train_patches": int(train_sharp.shape[0]),
         "train_metrics": train_metrics,
         "test_metrics": test_results,
+        "psf_params": model.describe(),
+        "stability": stability,
     }
     with open(out_dir / f"report_focusStep{args.focus_step}_pos{cy}_{cx}.json", "w") as f:
         json.dump(report, f, indent=2)
 
     fig, axes = plt.subplots(2, 4, figsize=(14, 7))
     axes[0, 0].imshow(kernel.cpu().numpy(), cmap="viridis")
-    axes[0, 0].set_title(f"fitted PSF ({args.kernel_size}x{args.kernel_size})")
+    axes[0, 0].set_title(f"fitted PSF ({args.model}, {args.kernel_size}x{args.kernel_size})")
     axes[1, 0].axis("off")
     for row, label in enumerate(["natural", "text"]):
         sharp_center, pred, blurred_np = test_examples[label]
