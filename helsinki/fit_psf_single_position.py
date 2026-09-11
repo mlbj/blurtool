@@ -36,10 +36,18 @@ independent across patches, so it adds variance to the estimate but -- given
 a low-dimensional model and/or enough pooled patches -- should not bias it
 toward a specific spurious kernel shape; see --stability-check.
 
+--denoise cleans the blurred targets with a frozen, pretrained cnFFDNet
+(helsinki/denoise.py) before fitting, so the kernel only has to explain blur,
+not sensor noise. It's a preprocessing step, not a jointly-optimized noise
+model -- deliberately, so it doesn't add more free parameters to a fit that
+can already be under-constrained (see the coma/astigmatism instability the
+zernike model showed across scene halves).
+
 Usage:
     python -m helsinki.fit_psf_single_position
     python -m helsinki.fit_psf_single_position --model freeform --steps 800
     python -m helsinki.fit_psf_single_position --stability-check
+    python -m helsinki.fit_psf_single_position --model zernike --denoise --stability-check
 """
 
 import argparse
@@ -319,10 +327,12 @@ def kernel_correlation(a, b):
 # ---------------------------------------------------------------------------
 # Data pooling / evaluation
 # ---------------------------------------------------------------------------
-def gather_patches(data_root, step, scene_ids, center, neighborhood, patch, kernel_size, stride, min_var):
+def gather_patches(data_root, step, scene_ids, center, neighborhood, patch, kernel_size, stride, min_var, denoise_fn=None):
     sharp_crops, blurred_crops = [], []
     for scene_id in scene_ids:
         sharp, blurred = load_pair(data_root, step, scene_id)
+        if denoise_fn is not None:
+            blurred = denoise_fn(blurred)
         for sharp_crop, blurred_crop in extract_patch_pairs(
             sharp, blurred, center, neighborhood, patch, kernel_size, stride, min_var
         ):
@@ -370,6 +380,14 @@ def parse_args():
     p.add_argument("--ssim-weight", type=float, default=1.0)
     p.add_argument("--smooth-weight", type=float, default=1e-3, help="freeform model only")
     p.add_argument("--no-taper", action="store_true", help="freeform model only: disable the Hann border taper")
+    p.add_argument("--denoise", action="store_true",
+                    help="Denoise blurred targets with a frozen pretrained cnFFDNet before fitting -- "
+                         "see helsinki/denoise.py. Keeps the kernel fit from having to explain sensor noise.")
+    p.add_argument("--cnffdnet-root", type=str, default=None,
+                    help="Path to the cnffdnet repo (default: a sibling directory of this repo)")
+    p.add_argument("--cnffdnet-checkpoint", type=str, default=None,
+                    help="Path to a cnFFDNet checkpoint (default: checkpoints/cnffd_sca2_bs128_p66_lr3_depth15.pth "
+                         "under --cnffdnet-root)")
     p.add_argument("--stability-check", action="store_true",
                     help="Also fit independently on two random disjoint halves of the training scenes "
                          "and report kernel correlation, to check sensitivity to sensor noise vs. real signal")
@@ -404,6 +422,23 @@ def main():
     print(f"train scenes: {len(train_scenes)}  |  held out: {args.test_natural!r}, {args.test_text!r}")
     print(f"psf model: {args.model}")
 
+    denoise_fn = None
+    if args.denoise:
+        from helsinki.denoise import denoise_image, estimate_noise_sigma, load_cnffdnet
+
+        cnf_model = load_cnffdnet(args.cnffdnet_root, args.cnffdnet_checkpoint, repo_root=REPO_ROOT, device=device)
+
+        _sigma_logged = []
+
+        def denoise_fn(blurred_full, _cnf_model=cnf_model, _log=_sigma_logged):
+            sigma = estimate_noise_sigma(blurred_full)
+            if not _log:
+                print(f"  (estimated noise sigma, first scene: {sigma:.4f})")
+                _log.append(sigma)
+            return denoise_image(_cnf_model, blurred_full, sigma, device=device)
+
+        print("denoising enabled: blurred targets cleaned with a frozen pretrained cnFFDNet before fitting")
+
     common = dict(
         center=(cy, cx),
         neighborhood=args.neighborhood,
@@ -411,7 +446,9 @@ def main():
         kernel_size=args.kernel_size,
         stride=args.stride,
     )
-    train_sharp, train_blurred = gather_patches(data_root, args.focus_step, train_scenes, min_var=args.min_var, **common)
+    train_sharp, train_blurred = gather_patches(
+        data_root, args.focus_step, train_scenes, min_var=args.min_var, denoise_fn=denoise_fn, **common
+    )
     print(f"pooled training patches: {train_sharp.shape[0]} "
           f"(each {args.patch}x{args.patch}, {args.min_var=} filter)")
 
@@ -428,7 +465,9 @@ def main():
         half_a, half_b = shuffled[: len(shuffled) // 2], shuffled[len(shuffled) // 2 :]
         kernels = []
         for label, half in [("A", half_a), ("B", half_b)]:
-            sharp_h, blurred_h = gather_patches(data_root, args.focus_step, half, min_var=args.min_var, **common)
+            sharp_h, blurred_h = gather_patches(
+                data_root, args.focus_step, half, min_var=args.min_var, denoise_fn=denoise_fn, **common
+            )
             sharp_h, blurred_h = sharp_h.to(device), blurred_h.to(device)
             model_h = make_psf_model(args, device, seed=args.seed)
             kernel_h = fit_psf(model_h, sharp_h, blurred_h, window, args, log_prefix=f"  [half {label}] ")
@@ -452,7 +491,9 @@ def main():
     test_results = {}
     test_examples = {}
     for label, scene_id in [("natural", args.test_natural), ("text", args.test_text)]:
-        sharp, blurred = gather_patches(data_root, args.focus_step, [scene_id], min_var=0.0, **common)
+        sharp, blurred = gather_patches(
+            data_root, args.focus_step, [scene_id], min_var=0.0, denoise_fn=denoise_fn, **common
+        )
         sharp, blurred = sharp.to(device), blurred.to(device)
         metrics = evaluate(sharp, blurred, kernel, window, pad)
         test_results[label] = {"scene_id": scene_id, "n_patches": sharp.shape[0], **metrics}
@@ -488,8 +529,9 @@ def main():
     axes[1, 0].axis("off")
     for row, label in enumerate(["natural", "text"]):
         sharp_center, pred, blurred_np = test_examples[label]
+        blurred_title = "real blurred (denoised)" if args.denoise else "real blurred"
         for col, (img, title) in enumerate(
-            [(sharp_center, "sharp (input)"), (pred, "predicted blur"), (blurred_np, "real blurred")]
+            [(sharp_center, "sharp (input)"), (pred, "predicted blur"), (blurred_np, blurred_title)]
         ):
             ax = axes[row, col + 1]
             ax.imshow(img, cmap="gray", vmin=0, vmax=1)
